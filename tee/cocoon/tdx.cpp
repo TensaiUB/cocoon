@@ -29,6 +29,7 @@
 #include "td/utils/Time.h"
 #include "td/utils/Variant.h"
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -1026,8 +1027,9 @@ struct DefaultPolicy : public Policy {
     CHECK(attestation_data.is_tdx());
     const auto &attestation = attestation_data.as_tdx();
 
-    // Verify reportdata matches user claims
-    if (user_claims.to_hash() != attestation.reportdata) {
+    // Verify reportdata matches user claims (unless explicitly skipped)
+    const bool skip_user_claims = std::getenv("COCOON_SKIP_TDX_USERCLAIMS") != nullptr;
+    if (!skip_user_claims && user_claims.to_hash() != attestation.reportdata) {
       return td::Status::Error("Report data mismatch (user claims don't match attestation)");
     }
 
