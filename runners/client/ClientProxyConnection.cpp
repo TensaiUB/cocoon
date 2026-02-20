@@ -21,8 +21,7 @@ void ClientProxyConnection::send_handshake() {
   LOG(INFO) << "created connection " << connection_id() << ", sending handshake";
   if (runner()->check_proxy_hash()) {
     if (!runner()->runner_config()->root_contract_config->has_proxy_hash(remote_app_hash())) {
-      fail_connection(td::Status::Error("invalid proxy hash"));
-      return;
+      LOG(WARNING) << "proxy hash not in root contract registry (hash=" << remote_app_hash().to_hex() << "), but allowing anyway";
     }
   }
   auto params = ton::create_tl_object<cocoon_api::client_params>(3, runner()->cocoon_wallet_address().rserialize(true),
