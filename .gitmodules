@@ -1,6 +1,6 @@
 [submodule "ton"]
 	path = ton
-	url = https://github.com/ton-blockchain/ton/
+	url = https://github.com/tensaiub/ton
 	branch = birydrad-testnet
 [submodule "third-party/nlohmann-json"]
 	path = third-party/nlohmann-json
