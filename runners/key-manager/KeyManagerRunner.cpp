@@ -6,11 +6,13 @@
 #include "td/actor/actor.h"
 #include "td/utils/Random.h"
 #include "td/utils/SharedSlice.h"
+#include "td/utils/base64.h"
 #include "td/utils/common.h"
 #include "td/utils/filesystem.h"
 #include "td/db/RocksDb.h"
 #include "td/utils/misc.h"
 #include "td/utils/overloaded.h"
+#include "runners/smartcontracts/Opcodes.hpp"
 
 #include "cocoon-tl-utils/cocoon-tl-utils.hpp"
 #include "git.h"
@@ -20,6 +22,7 @@
 #include "auto/tl/cocoon_api.hpp"
 #include "td/utils/port/Clocks.h"
 #include "tl/TlObject.h"
+#include "vm/cells/CellBuilder.h"
 #include <memory>
 
 namespace cocoon {
@@ -37,6 +40,11 @@ void KeyManagerRunner::load_config(td::Promise<td::Unit> promise) {
     }
     set_rpc_port((td::uint16)conf.rpc_port_, remote_app_type_unknown());
 
+    TRY_RESULT_PREFIX(owner_address, block::StdAddress::parse(conf.owner_address_), "failed to parse owner address: ");
+    owner_address.testnet = is_testnet();
+    owner_address.bounceable = false;
+    set_owner_address(owner_address);
+
     TRY_RESULT_PREFIX(rc_address, block::StdAddress::parse(conf.root_contract_address_),
                       "cannot parse root contract address: ");
     rc_address.testnet = is_testnet();
@@ -46,6 +54,9 @@ void KeyManagerRunner::load_config(td::Promise<td::Unit> promise) {
       set_ton_config_filename(conf.ton_config_filename_);
     }
 
+    wallet_private_key_ = std::make_unique<td::Ed25519::PrivateKey>(td::SecureString(conf.node_wallet_key_.as_slice()));
+    wallet_public_key_.as_slice().copy_from(wallet_private_key_->get_public_key().move_as_ok().as_octet_string());
+
     private_key_ =
         std::make_unique<td::Ed25519::PrivateKey>(td::SecureString(conf.machine_specific_private_key_.as_slice()));
     public_key_.as_slice().copy_from(private_key_->get_public_key().move_as_ok().as_octet_string());
@@ -54,10 +65,11 @@ void KeyManagerRunner::load_config(td::Promise<td::Unit> promise) {
         td::Ed25519::PublicKey::from_slice(public_key_.as_slice()).move_as_ok());
 
     if (conf.check_hashes_ || !conf.is_test_) {
-      set_fake_tdx(false);
+      set_fake_tee(false);
       enable_check_hashes();
     } else {
-      set_fake_tdx(true);
+      set_fake_tee(true);
+      add_static_private_key();
     }
     set_http_access_hash(conf.http_access_hash_);
     set_is_test(conf.is_test_);
@@ -102,38 +114,51 @@ void KeyManagerRunner::custom_initialize(td::Promise<td::Unit> promise) {
     return td::Status::OK();
   });
 
+  register_custom_http_handler("/stats", [&](http::HttpCallback::RequestType request_type,
+                                             std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                             std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                             std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+    http_send_static_answer(http_generate_main(), std::move(answer_callback));
+  });
   register_custom_http_handler(
-      "/stats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_generate_main(), std::move(promise)); });
+      "/jsonstats",
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_generate_json_stats(), std::move(answer_callback), "application/json");
+      });
   register_custom_http_handler(
       "/request/removekey",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        if (request->method() != "POST" && request->method() != "post") {
-          http_send_static_answer(wrap_short_answer_to_http("removekey must be a post request"), std::move(promise));
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        if (request_type == http::HttpCallback::RequestType::Post) {
+          http_send_static_answer(http_remove_key(get_from_sorted_list(args, "key")), std::move(answer_callback));
         } else {
-          http_send_static_answer(http_remove_key(get_args["key"]), std::move(promise));
+          http_send_static_answer(404, "not found", std::move(answer_callback));
         }
       });
   register_custom_http_handler(
       "/request/generatekey",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        if (request->method() != "POST" && request->method() != "post") {
-          http_send_static_answer(wrap_short_answer_to_http("generatekey must be a post request"), std::move(promise));
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        if (request_type == http::HttpCallback::RequestType::Post) {
+          http_send_static_answer(http_generate_key(get_from_sorted_list(args, "type")), std::move(answer_callback));
         } else {
-          http_send_static_answer(http_generate_key(get_args["type"]), std::move(promise));
+          http_send_static_answer(404, "not found", std::move(answer_callback));
         }
       });
 
-  promise.set_value(td::Unit());
+  cocoon_wallet_initialize_wait_for_balance_and_get_seqno(
+      wallet_private_key_->as_octet_string(), owner_address_, min_wallet_balance(),
+      [self_id = actor_id(this), promise = std::move(promise)](td::Result<td::Unit> R) mutable {
+        if (R.is_error()) {
+          promise.set_error(R.move_as_error());
+          return;
+        }
+        promise.set_value(td::Unit());
+      });
 }
 
 void KeyManagerRunner::process_db_key(td::Slice key, td::Slice value) {
@@ -158,8 +183,7 @@ void KeyManagerRunner::process_db_key(td::Slice key, td::Slice value) {
                                            .move_as_ok()
                                            .as_octet_string());
     CHECK(P->public_key.to_hex() == key);
-    P->for_proxies = obj->for_proxies_;
-    P->for_workers = obj->for_workers_;
+    P->key_type_ = (td::uint8)obj->key_type_;
     P->valid_since_ = obj->valid_since_utime_;
     P->valid_until_ = obj->valid_until_utime_;
     P->valid_since_config_version_ = obj->valid_since_config_version_;
@@ -214,7 +238,7 @@ void KeyManagerRunner::set_to_db(td::Slice key, td::Slice value) {
 void KeyManagerRunner::alarm() {
   BaseRunner::alarm();
 
-  if (is_initialized()) {
+  if (!is_initialized()) {
     return;
   }
 
@@ -223,26 +247,22 @@ void KeyManagerRunner::alarm() {
     active_config_version_ = runner_config()->root_contract_config->version();
     config_to_db();
   }
-  td::int32 w_cnt = 0, p_cnt = 0;
+  td::int32 p_cnt = 0;
+  td::int32 last_generated_at = 0;
   for (auto it = private_keys_.begin(); it != private_keys_.end();) {
     if ((*it)->valid_until_ < td::Clocks::system()) {
       kv_->erase(PSTRING() << "key_" << (*it)->public_key.to_hex());
       it = private_keys_.erase(it);
     } else {
-      if ((*it)->for_proxies) {
+      if ((*it)->key_type_ == 1) {
         p_cnt++;
-      }
-      if ((*it)->for_workers) {
-        w_cnt++;
+        last_generated_at = std::max(last_generated_at, (*it)->valid_since_);
       }
       it++;
     }
   }
-  if (w_cnt == 0) {
-    generate_key(false, true);
-  }
-  if (p_cnt == 0) {
-    generate_key(true, false);
+  if (p_cnt == 0 || (last_generated_at + key_generate_period()) < td::Clocks::system()) {
+    generate_key(1);
   }
   kv_->commit_transaction().ensure();
   kv_->flush().ensure();
@@ -267,11 +287,15 @@ void KeyManagerRunner::receive_query(TcpClient::ConnectionId connection_id, td::
       if (check_hashes_ && !runner_config()->root_contract_config->has_proxy_hash(conn->remote_app_hash())) {
         return promise.set_error(td::Status::Error(ton::ErrorCode::error, "unknown proxy hash"));
       }
+      {
+        auto S = check_verification_key(remote_app_type_proxy(), conn->verified_by());
+        if (S.is_error()) {
+          return promise.set_error(std::move(S));
+        }
+      }
       std::vector<ton::tl_object_ptr<cocoon_api::keyManager_privateKey>> pks;
       for (auto &k : private_keys_) {
-        if (k->for_proxies) {
-          pks.push_back(ton::create_tl_object<cocoon_api::keyManager_privateKey>(k->valid_until_, k->private_key));
-        }
+        pks.push_back(ton::create_tl_object<cocoon_api::keyManager_privateKey>(k->valid_until_, k->private_key));
       }
       promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::keyManager_privateKeys>(std::move(pks)));
       return;
@@ -280,11 +304,15 @@ void KeyManagerRunner::receive_query(TcpClient::ConnectionId connection_id, td::
       if (check_hashes_ && !runner_config()->root_contract_config->has_worker_hash(conn->remote_app_hash())) {
         return promise.set_error(td::Status::Error(ton::ErrorCode::error, "unknown worker hash"));
       }
+      {
+        auto S = check_verification_key(remote_app_type_worker(), conn->verified_by());
+        if (S.is_error()) {
+          return promise.set_error(std::move(S));
+        }
+      }
       std::vector<ton::tl_object_ptr<cocoon_api::keyManager_privateKey>> pks;
       for (auto &k : private_keys_) {
-        if (k->for_workers) {
-          pks.push_back(ton::create_tl_object<cocoon_api::keyManager_privateKey>(k->valid_until_, k->private_key));
-        }
+        pks.push_back(ton::create_tl_object<cocoon_api::keyManager_privateKey>(k->valid_until_, k->private_key));
       }
       promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::keyManager_privateKeys>(std::move(pks)));
       return;
@@ -293,12 +321,6 @@ void KeyManagerRunner::receive_query(TcpClient::ConnectionId connection_id, td::
       LOG(ERROR) << "received query with unknown magic " << td::format::as_hex(magic);
       promise.set_error(td::Status::Error(ton::ErrorCode::failure, "unknown query magic"));
   }
-}
-
-void KeyManagerRunner::receive_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
 }
 
 void KeyManagerRunner::remove_key(td::Bits256 public_key) {
@@ -311,27 +333,49 @@ void KeyManagerRunner::remove_key(td::Bits256 public_key) {
   }
 }
 
-void KeyManagerRunner::generate_key(bool for_proxies, bool for_workers) {
+void KeyManagerRunner::add_static_private_key() {
+  auto P = std::make_unique<PrivateKey>();
+  P->key_type_ = 1;
+  P->private_key.as_slice().copy_from(td::base64_decode("BwrYLmEy2rMgZ/tyCv0AYFVaZPkFu+wNwoSQiJUbOmM=").move_as_ok());
+  P->public_key.as_slice().copy_from(td::base64_decode("+2fQ/NM48g4NSVfZ6CrcEB0uNROkSKOrRgUu4biMWBg=").move_as_ok());
+  P->valid_since_ = (td::int32)td::Clocks::system();
+  P->valid_until_ = 2000000000;
+  P->valid_since_config_version_ = active_config_version_;
+  private_keys_.push_back(std::move(P));
+}
+
+PrivateKey *KeyManagerRunner::generate_key(td::uint8 key_type) {
   td::SecureString s(32);
   td::Random::secure_bytes(s.as_mutable_slice());
   td::Ed25519::PrivateKey pk(std::move(s));
   auto pub = pk.get_public_key().move_as_ok();
 
   auto P = std::make_unique<PrivateKey>();
-  P->for_proxies = for_proxies;
-  P->for_workers = for_workers;
+  P->key_type_ = key_type;
   P->private_key.as_slice().copy_from(pk.as_octet_string().as_slice());
   P->public_key.as_slice().copy_from(pub.as_octet_string().as_slice());
   P->valid_since_ = (td::int32)td::Clocks::system();
   P->valid_until_ = P->valid_since_ + key_ttl();
   P->valid_since_config_version_ = active_config_version_;
 
+  auto ptr = P.get();
+
   set_to_db(PSTRING() << "key_" << P->public_key.to_hex(),
             cocoon::create_serialize_tl_object<cocoon_api::keyManagerDb_key>(
-                P->private_key, P->for_workers, P->for_proxies, P->valid_since_config_version_, P->valid_since_,
-                P->valid_until_));
+                P->private_key, P->key_type_, P->valid_since_config_version_, P->valid_since_, P->valid_until_));
 
   private_keys_.push_back(std::move(P));
+
+  if (ptr) {
+    vm::CellBuilder cb;
+    cb.store_long(opcodes::root_add_public_key_signed, 32).store_long(td::Random::fast_uint64());
+    ptr->serialize(cb);
+
+    auto msg = sign_and_wrap_message(*private_key_, cb.finalize(), cocoon_wallet()->address());
+    cocoon_wallet()->send_transaction(root_contract_address(), to_nano(0.4), {}, std::move(msg), {});
+  }
+
+  return ptr;
 }
 
 std::string KeyManagerRunner::http_generate_main() {
@@ -380,18 +424,27 @@ std::string KeyManagerRunner::http_generate_main() {
        << "</td></tr>\n";
     sb << "</table>\n";
   }
+  {
+    sb << "<h1>LOCAL CONFIG</h1>\n";
+    sb << "<table>\n";
+    sb << "<tr><td>root address</td><td>" << address_link(root_contract_address()) << "</td></tr>\n";
+    sb << "<tr><td>owner address</td><td>" << address_link(owner_address()) << "</td></tr>\n";
+    sb << "<tr><td>check hashes</td><td>" << (check_hashes_ ? "YES" : "NO") << "</td></tr>\n";
+    sb << "<tr><td>public key</td><td>" << public_key_.to_hex() << "</td></tr>\n";
+    sb << "</table>\n";
+  }
   store_wallet_stat(sb);
   store_root_contract_stat(sb);
   {
     sb << "<h1>KEYS</h1>\n";
     sb << "<table>\n";
-    sb << "<tr><td>key</td><td>for proxies</td><td>for workers</td><td>valid since config version</td><td>valid "
+    sb << "<tr><td>key</td><td>key type</td><td>valid since config version</td><td>valid "
           "since</td><td>valid until</td></tr>\n";
     for (auto &it : private_keys_) {
       const auto &k = *it;
-      sb << "<tr><td>" << k.public_key.to_hex() << "</td><td>" << (k.for_proxies ? "YES" : "NO") << "</td><td>"
-         << (k.for_workers ? "YES" : "NO") << "</td><td>" << k.valid_since_config_version_ << "</td><td>"
-         << k.valid_since_ << "</td><td>" << k.valid_until_ << "</td></tr>\n";
+      sb << "<tr><td>" << k.public_key.to_hex() << "</td><td>" << k.key_type_ << "</td><td>"
+         << k.valid_since_config_version_ << "</td><td>" << k.valid_since_ << "</td><td>" << k.valid_until_
+         << "</td></tr>\n";
     }
     sb << "</table>\n";
   }
@@ -442,15 +495,14 @@ std::string KeyManagerRunner::http_remove_key(std::string pub_key) {
 }
 
 std::string KeyManagerRunner::http_generate_key(std::string key_type) {
-  if (key_type == "worker") {
-    generate_key(false, true);
-  } else if (key_type == "proxy") {
-    generate_key(true, false);
-  } else if (key_type == "proxyworker") {
-    generate_key(true, true);
-  } else {
-    return wrap_short_answer_to_http(PSTRING() << "unknown key type " << key_type);
+  if (key_type == "") {
+    key_type = "1";
   }
+  auto R = td::to_integer_safe<td::uint8>(key_type);
+  if (R.is_error()) {
+    return wrap_short_answer_to_http(PSTRING() << "failed to parse integer: " << key_type);
+  }
+  generate_key(R.move_as_ok());
   kv_->flush().ensure();
   return wrap_short_answer_to_http(PSTRING() << "key generated");
 }

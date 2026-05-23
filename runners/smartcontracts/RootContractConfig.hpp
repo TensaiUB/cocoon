@@ -18,6 +18,11 @@ namespace cocoon {
 class BaseRunner;
 struct SimpleJsonSerializer;
 
+struct RootContractPublicKeyInfo {
+  td::uint8 key_type;
+  td::uint32 expire_at;
+};
+
 class RootContractConfig {
  public:
   RootContractConfig() = default;
@@ -42,7 +47,7 @@ class RootContractConfig {
                                                                       bool is_testnet);
   static td::Result<std::unique_ptr<RootContractConfig>> load_from_tl(const cocoon_api::rootConfig_pseudo &config,
                                                                       bool is_testnet);
-  static td::Result<std::unique_ptr<RootContractConfig>> load_from_tl(const cocoon_api::rootConfig_configV5 &config,
+  static td::Result<std::unique_ptr<RootContractConfig>> load_from_tl(const cocoon_api::rootConfig_configV7 &config,
                                                                       bool is_testnet);
 
   ton::tl_object_ptr<cocoon_api::rootConfig_Config> serialize() const;
@@ -165,6 +170,24 @@ class RootContractConfig {
   void store_stat(BaseRunner *runner, td::StringBuilder &sb);
   void store_stat(BaseRunner *runner, SimpleJsonSerializer &sb);
 
+  const auto &key_manager_address() const {
+    return key_manager_addr_;
+  }
+
+  const auto &key_manager_image_hash() const {
+    return key_manager_image_hash_;
+  }
+
+  bool has_proxy_verified_key(const td::Bits256 &key) const {
+    return std::binary_search(verified_proxy_keys_.begin(), verified_proxy_keys_.end(), key);
+  }
+  bool has_worker_verified_key(const td::Bits256 &key) const {
+    return std::binary_search(verified_worker_keys_.begin(), verified_worker_keys_.end(), key);
+  }
+  bool has_key_manager_verified_key(const td::Bits256 &key) const {
+    return std::binary_search(verified_key_manager_keys_.begin(), verified_key_manager_keys_.end(), key);
+  }
+
  private:
   block::StdAddress owner_;
 
@@ -189,6 +212,15 @@ class RootContractConfig {
   td::uint32 client_delay_before_close_;
   td::uint64 min_proxy_stake_;
   td::uint64 min_client_stake_;
+
+  std::map<td::Bits256, RootContractPublicKeyInfo> public_keys_;
+  td::Bits256 key_manager_public_key_ = td::Bits256::zero();
+  td::Bits256 key_manager_image_hash_ = td::Bits256::zero();
+  td::IPAddress key_manager_addr_;
+
+  std::vector<td::Bits256> verified_proxy_keys_;
+  std::vector<td::Bits256> verified_worker_keys_;
+  std::vector<td::Bits256> verified_key_manager_keys_;
 
   td::Ref<vm::Cell> proxy_sc_code_;
   td::Ref<vm::Cell> worker_sc_code_;

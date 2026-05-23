@@ -4,8 +4,8 @@ Requires=docker.service
 After=docker.service
 
 [Service]
-ExecStartPre=/usr/bin/docker pull lmsysorg/sglang:v0.5.5.post3@sha256:97fe3876fd7f0d27c72c79f612b024e08e9ac4ffdc52b5e4f81b7b53e1f3e819
-ExecStart=docker run --rm --gpus all --name %n -v /mnt/model:/model -p 8000:8000 --ipc=host --entrypoint=python3 lmsysorg/sglang:v0.5.5.post3@sha256:97fe3876fd7f0d27c72c79f612b024e08e9ac4ffdc52b5e4f81b7b53e1f3e819 -m sglang.launch_server --tp=1 --trust-remote-code --host 0.0.0.0 --port 8000 --model /model --served-model-name $MODEL_NAME --enable-cache-report
+ExecStartPre=/usr/bin/docker pull lmsysorg/sglang:v0.5.10.post1-cu130-runtime@sha256:715c461258624eae38124dcb1e1f620cbe307594fd3403ab92caf1b7017afd0f
+ExecStart=docker run --rm --gpus all --name %n -v /mnt/model:/model -p 8000:8000 --ipc=host --entrypoint=python3 lmsysorg/sglang:v0.5.10.post1-cu130-runtime@sha256:715c461258624eae38124dcb1e1f620cbe307594fd3403ab92caf1b7017afd0f -m sglang.launch_server --tp=1 --trust-remote-code --host 0.0.0.0 --port 8000 --model /model --served-model-name $MODEL_NAME --enable-cache-report
 ExecStop=-/usr/bin/docker stop %n
 
 TimeoutStartSec=2h

@@ -20,7 +20,8 @@ namespace cocoon {
 
 class ClientRunner : public BaseRunner {
  public:
-  ClientRunner(std::string engine_config_filename) : BaseRunner(std::move(engine_config_filename)) {
+  ClientRunner(std::string engine_config_filename, td::actor::Scheduler *scheduler)
+      : BaseRunner(RunnerRole::Client, std::move(engine_config_filename), scheduler) {
   }
 
   /* CONST PARAMS */
@@ -31,7 +32,7 @@ class ClientRunner : public BaseRunner {
     return 1;
   }
   static constexpr td::int32 max_proto_version() {
-    return 2;
+    return 4;
   }
   static constexpr size_t request_log_size() {
     return 1;
@@ -47,9 +48,6 @@ class ClientRunner : public BaseRunner {
   const auto &secret_hash() const {
     return secret_hash_;
   }
-  bool check_proxy_hash() const {
-    return check_proxy_hash_;
-  }
 
   /* SIMPLE SETTERS */
   void set_owner_address(block::StdAddress owner_address) {
@@ -58,9 +56,6 @@ class ClientRunner : public BaseRunner {
   void set_secret_string(td::SecureString secret_string) {
     secret_string_ = std::move(secret_string);
     secret_hash_ = td::sha256_bits256(secret_string_.as_slice());
-  }
-  void enable_check_proxy_hash() {
-    check_proxy_hash_ = true;
   }
 
   /* CHARGE AND TOP UP */
@@ -75,20 +70,21 @@ class ClientRunner : public BaseRunner {
   }
 
   /* REQUEST */
-  void run_http_request(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-          promise);
-  void run_get_models_request(
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-          promise);
+  void run_http_request(http::HttpCallback::RequestType request_type,
+                        std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                        std::vector<std::pair<std::string, std::string>> args, std::string body,
+                        std::unique_ptr<http::HttpRequestCallback> answer_callback);
+  void run_get_models_request(std::unique_ptr<http::HttpRequestCallback> answer_callback);
   void finish_request(td::Bits256 request_id, std::shared_ptr<ClientProxyInfo> proxy);
 
   /* ALLOCATORS */
-  std::unique_ptr<ProxyOutboundConnection> allocate_proxy_outbound_connection(
-      TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id, const RemoteAppType &remote_app_type,
-      const td::Bits256 &remote_app_hash) override {
-    return std::make_unique<ClientProxyConnection>(this, remote_app_type, remote_app_hash, connection_id, target_id);
+  std::unique_ptr<ProxyOutboundConnection> allocate_proxy_outbound_connection(TcpClient::ConnectionId connection_id,
+                                                                              TcpClient::TargetId target_id,
+                                                                              const RemoteAppType &remote_app_type,
+                                                                              const td::Bits256 &remote_app_hash,
+                                                                              const td::Bits256 &verified_by) override {
+    return std::make_unique<ClientProxyConnection>(this, remote_app_type, remote_app_hash, verified_by, connection_id,
+                                                   target_id);
   }
   std::unique_ptr<ProxyTarget> allocate_proxy_target(TcpClient::TargetId target_id,
                                                      const td::IPAddress &addr) override {
@@ -107,10 +103,10 @@ class ClientRunner : public BaseRunner {
   void receive_query(TcpClient::ConnectionId connection_id, td::BufferSlice query,
                      td::Promise<td::BufferSlice> promise) override {
   }
-  void receive_http_request(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise)
-      override;
+  void receive_http_request(http::HttpCallback::RequestType request_type,
+                            std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                            std::vector<std::pair<std::string, std::string>> args, std::string body,
+                            std::unique_ptr<http::HttpRequestCallback> answer_callback) override;
 
   /* PROXY DB*/
   td::Result<std::shared_ptr<ClientProxyInfo>> register_proxy(
@@ -195,8 +191,6 @@ class ClientRunner : public BaseRunner {
   td::Timestamp next_payment_compare_at_;
   td::Timestamp next_update_balances_at_;
   td::uint32 params_version_{0};
-
-  bool check_proxy_hash_{false};
 
   std::shared_ptr<ClientStats> stats_ = std::make_shared<ClientStats>();
 };

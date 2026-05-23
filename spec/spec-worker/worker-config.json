@@ -7,11 +7,12 @@
   "model_name" : "$MODEL_NAME@$MODEL_COMMIT:$MODEL_VERITY_HASH",
   "ton_config_filename": "$TON_CONFIG_FILE",
   "owner_address": "$OWNER_ADDRESS",
-  "image_hash": "$TDX_IMAGE_HASH",
+  "image_hash": "$TEE_IMAGE_HASH",
   "root_contract_address": "$ROOT_CONTRACT_ADDRESS",
   "node_wallet_key": "$NODE_WALLET_KEY",
   "connect_to_proxy_via": "127.0.0.1:8116",
   "forward_requests_to": "127.0.0.1:8000",
   "coefficient": "$WORKER_COEFFICIENT",
-  "max_active_requests": 60
+  "max_active_requests": 60,
+  "machine_description_json" : "{\"test\":true}"
 }

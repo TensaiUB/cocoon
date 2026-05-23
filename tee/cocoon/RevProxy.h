@@ -2,7 +2,8 @@
 #include "td/net/TcpListener.h"
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/SharedValue.h"
-#include "tdx.h"
+#include "tee/cocoon/RATLS.h"
+#include "tee/cocoon/Tee.h"
 #include "td/actor/coro_task.h"
 #include "td/net/Pipe.h"
 
@@ -12,8 +13,8 @@ class RevProxy final : public td::actor::Actor {
   struct Config {
     int src_port_{8081};  // port to listen
     td::IPAddress dst_;
-    td::SharedValue<tdx::CertAndKey> cert_and_key_;
-    tdx::PolicyRef policy_;
+    td::SharedValue<TeeCertAndKey> cert_and_key_;
+    RATLSPolicyRef policy_;
     bool serialize_info{false};
 
     // Proof of work (always enabled)

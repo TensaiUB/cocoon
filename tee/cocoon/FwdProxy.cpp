@@ -4,7 +4,7 @@
 #include "td/utils/BufferedFd.h"
 #include "td/utils/optional.h"
 #include "td/utils/format.h"
-#include "tdx.h"
+#include "tee/cocoon/tdx/tdx.h"
 #include "utils.h"
 #include "td/net/Pipe.h"
 #include "td/net/utils.h"
@@ -15,7 +15,7 @@ namespace cocoon {
 struct Answer {
   td::SocketPipe src;
   td::SocketPipe dst;
-  tdx::PolicyRef policy;
+  RATLSPolicyRef policy;
   td::IPAddress destination;
 };
 
@@ -226,13 +226,14 @@ class Socks5Init : public td::TaskActor<Answer> {
 
   td::SocketPipe pipe_;
   td::SocketPipe dest_pipe_;
-  tdx::PolicyRef policy_;
+  RATLSPolicyRef policy_;
   td::IPAddress destination_;
 
   std::shared_ptr<const FwdProxy::Config> config_;
 };
 
 namespace {
+
 struct AcceptAndProxy : td::TaskActor<ProxyState> {
   AcceptAndProxy(td::SocketFd socket, std::shared_ptr<const FwdProxy::Config> config)
       : socket_(std::move(socket)), config_(std::move(config)) {
@@ -243,7 +244,7 @@ struct AcceptAndProxy : td::TaskActor<ProxyState> {
 
     td::SocketPipe left;
     td::SocketPipe right;
-    tdx::PolicyRef policy;
+    RATLSPolicyRef policy;
 
     if (config_->skip_socks5) {
       // Forward proxy mode: directly connect to fixed destination
@@ -272,7 +273,7 @@ struct AcceptAndProxy : td::TaskActor<ProxyState> {
     auto [tls_pipe, peer_info] =
         co_await wrap_tls_client("-Fwd-" + desc, std::move(right), config_->cert_and_key_.load(), policy,
                                  state_.source_.value(), state_.destination_.value());
-    state_.set_attestation(peer_info.attestation_data);
+    state_.set_attestation(peer_info.report());
 
     if (config_->serialize_info) {
       co_await framed_tl_write(left.output_buffer(), peer_info);
@@ -294,7 +295,7 @@ struct AcceptAndProxy : td::TaskActor<ProxyState> {
 };
 }  // namespace
 
-td::Result<tdx::PolicyRef> FwdProxy::Config::find_policy(td::Slice username) const {
+td::Result<RATLSPolicyRef> FwdProxy::Config::find_policy(td::Slice username) const {
   auto it = policies_.find(username);
   if (it == policies_.end()) {
     return td::Status::Error(PSLICE() << "Unknown policy: " << username);

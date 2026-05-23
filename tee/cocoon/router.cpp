@@ -32,24 +32,31 @@ td::Status validate_port(int port) {
   return td::Status::OK();
 }
 
+template <typename T>
+td::Result<T> parse_hex(td::Slice hash_str) {
+  TRY_RESULT(hash_bytes, td::hex_decode(hash_str));
+  if (hash_bytes.size() != sizeof(T)) {
+    return td::Status::Error(PSLICE() << "hash must be" << sizeof(T) * 2 << " hex chars (" << sizeof(T)
+                                      << " bytes), got " << hash_str.size());
+  }
+
+  return td::as<T>(hash_bytes.data());
+}
+
 template <class T>
 td::Status parse_list_of_hex(td::Slice list, std::vector<T> &hashes) {
   auto hash_parts = td::full_split(list, ',');
   for (const auto &hash_str : hash_parts) {
-    TRY_RESULT(image_hash_bytes, td::hex_decode(hash_str));
-    if (image_hash_bytes.size() != sizeof(T)) {
-      return td::Status::Error(PSLICE() << "hash must be" << sizeof(T) * 2 << " hex chars (" << sizeof(T)
-                                        << " bytes), got " << hash_str.size());
-    }
-    T hash = td::as<T>(image_hash_bytes.data());
+    TRY_RESULT(hash, parse_hex<T>(hash_str));
     hashes.push_back(hash);
   }
   return td::Status::OK();
 }
 
 // Create policies from configuration
-std::map<std::string, tdx::PolicyRef, std::less<>> create_policies_from_config(const ProxyConfig &config) {
-  std::map<std::string, tdx::PolicyRef, std::less<>> policies;
+std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> create_policies_from_config(td::actor::Scheduler *scheduler,
+                                                                                       const ProxyConfig &config) {
+  std::map<std::string, cocoon::RATLSPolicyRef, std::less<>> policies;
 
   // Create shared attestation cache for all TDX policies
   auto attestation_cache = cocoon::AttestationCache::create(cocoon::AttestationCache::Config{.max_entries = 10000});
@@ -57,26 +64,27 @@ std::map<std::string, tdx::PolicyRef, std::less<>> create_policies_from_config(c
 
   // Add custom policies from configuration
   for (const auto &policy_config : config.policies) {
-    tdx::TdxInterfaceRef tdx_interface = nullptr;
+    cocoon::RATLSInterfaceRef ratls = nullptr;
 
-    // Create appropriate TDX interface based on type
+    // Might be filled from policy_config
+    cocoon::RATLSInterface::Config config{};
+
+    // Create appropriate TEE interface based on type
     if (policy_config.type == "any") {
-      tdx_interface = nullptr;
-    } else if (policy_config.type == "fake_tdx") {
-      tdx_interface = tdx::TdxInterface::create_fake();
-    } else if (policy_config.type == "tdx") {
-      auto base_tdx = tdx::TdxInterface::create();
-      // Wrap with caching layer
-      tdx_interface = tdx::TdxInterface::add_cache(base_tdx, attestation_cache);
+    } else if (policy_config.type == "fake_tee") {
+      ratls = cocoon::RATLSInterface::make(scheduler, true, config).move_as_ok();
+    } else if (policy_config.type == "tee") {
+      ratls = cocoon::RATLSInterface::add_cache(cocoon::RATLSInterface::make(scheduler, false, config).move_as_ok(),
+                                                std::move(attestation_cache))
+                  .move_as_ok();
     } else {
       LOG(WARNING) << "Unknown policy type: " << policy_config.type << ", using 'any'";
-      tdx_interface = nullptr;
     }
 
     // Create policy with full configuration
-    policies[policy_config.name] = tdx::Policy::make(tdx_interface, policy_config.tdx_config);
+    policies[policy_config.name] = cocoon::RATLSPolicy::make(std::move(ratls), policy_config.ratls_policy);
     LOG(INFO) << "Created policy '" << policy_config.name << "' type=" << policy_config.type
-              << " config=" << policy_config.tdx_config;
+              << " config=" << policy_config.ratls_policy;
   }
 
   return policies;
@@ -85,7 +93,7 @@ std::map<std::string, tdx::PolicyRef, std::less<>> create_policies_from_config(c
 // Command line argument parsing
 struct CliArgs {
   std::string config_file;
-  std::vector<PolicyConfig> cli_policies;
+  std::vector<cocoon::PolicyConfig> cli_policies;
   std::vector<PortConfig> cli_ports;
   std::string cert_base_name;
   int threads = 0;
@@ -96,32 +104,69 @@ struct CliArgs {
   td::int32 global_max_pow_difficulty = 28;
 };
 
+struct ImageHashes {
+  std::vector<td::UInt256> tdx;
+  std::vector<td::UInt256> sev;
+};
+
+td::Status parse_image_hashes(td::Slice spec, ImageHashes &image_hashes) {
+  auto hashes = td::full_split(spec, ',');
+  for (const auto &hash_str : hashes) {
+    if (hash_str.find('@') == td::Slice::npos) {
+      TRY_RESULT(hash, parse_hex<td::UInt256>(hash_str));
+      image_hashes.tdx.push_back(hash);
+      continue;
+    }
+
+    auto [type, h] = td::split(hash_str, '@');
+    TRY_RESULT(hash, parse_hex<td::UInt256>(h));
+
+    if (type == "tdx") {
+      image_hashes.tdx.push_back(hash);
+      continue;
+    }
+
+    if (type == "sev") {
+      image_hashes.sev.push_back(hash);
+      continue;
+    }
+
+    return td::Status::Error(PSLICE() << "Unexpected image hash type: " << type);
+  }
+
+  return td::Status::OK();
+}
+
 // Parse policy spec: NAME:TYPE[:image-hash]
 td::Status parse_policy_spec(td::Slice spec, PolicyConfig &policy_config) {
   auto parts = td::full_split(spec, ':');
   if (parts.size() < 2) {
-    return td::Status::Error("Policy spec must be: name:type[:image-hash]");
+    return td::Status::Error("Policy spec must be: name:type[:{tdx,sev}:image-hash]");
   }
 
   policy_config.name = parts[0].str();
   policy_config.type = parts[1].str();
 
-  if (policy_config.type != "any" && policy_config.type != "fake_tdx" && policy_config.type != "tdx") {
+  if (policy_config.type != "any" && policy_config.type != "fake_tee" && policy_config.type != "tee") {
     return td::Status::Error(PSLICE() << "Invalid policy type: " << policy_config.type);
   }
 
   // Optional image hashes (comma-separated)
   if (parts.size() >= 3 && !parts[2].empty()) {
-    TRY_STATUS(parse_list_of_hex(parts[2], policy_config.tdx_config.allowed_image_hashes));
+    ImageHashes image_hashes;
+    TRY_STATUS(parse_image_hashes(parts[2], image_hashes));
+
+    policy_config.ratls_policy.tdx_config.allowed_image_hashes = std::move(image_hashes.tdx);
+    policy_config.ratls_policy.sev_config.allowed_image_hashes = std::move(image_hashes.sev);
   }
 
   return td::Status::OK();
 }
 
 // Helper to parse policy[:image-hash] and create inline policy if needed
-// Handles both user-defined policy names and built-in types (any/tdx/fake_tdx)
+// Handles both user-defined policy names and built-in types (any/tee/fake_tee)
 td::Status parse_policy_and_image(td::Slice policy_spec, PortConfig &port_config,
-                                  std::vector<PolicyConfig> &inline_policies) {
+                                  std::vector<cocoon::PolicyConfig> &inline_policies) {
   auto policy_parts = td::full_split(policy_spec, ':');
   std::string policy_name = policy_parts[0].str();
 
@@ -132,10 +177,10 @@ td::Status parse_policy_and_image(td::Slice policy_spec, PortConfig &port_config
   }
 
   // Determine policy type:
-  // If it's a built-in name (any/tdx/fake_tdx), use it as TYPE
+  // If it's a built-in name (any/tee/fake_tee), use it as TYPE
   // Otherwise, it's a user-defined policy name - error (can't add image hash to named policy inline)
   std::string policy_type;
-  if (policy_name == "any" || policy_name == "tdx" || policy_name == "fake_tdx") {
+  if (policy_name == "any" || policy_name == "tee" || policy_name == "fake_tee") {
     policy_type = policy_name;
   } else {
     return td::Status::Error(PSLICE() << "Cannot specify image hash for user-defined policy '" << policy_name
@@ -149,10 +194,10 @@ td::Status parse_policy_and_image(td::Slice policy_spec, PortConfig &port_config
 
   // Create inline policy with unique name
   std::string inline_policy_name = PSTRING() << policy_type << "_inline_" << port_config.port;
-  PolicyConfig inline_policy;
+  cocoon::PolicyConfig inline_policy;
   inline_policy.name = inline_policy_name;
   inline_policy.type = policy_type;
-  inline_policy.tdx_config.allowed_image_hashes = std::move(hashes);
+  inline_policy.ratls_policy.tdx_config.allowed_image_hashes = std::move(hashes);
   inline_policies.push_back(inline_policy);
 
   port_config.policy_name = inline_policy_name;
@@ -161,7 +206,7 @@ td::Status parse_policy_and_image(td::Slice policy_spec, PortConfig &port_config
 
 // Generic parser: SPEC@POLICY[:image-hash]
 td::Status parse_proxy_spec(td::Slice spec, td::Slice type_name, td::CSlice expected_format, bool requires_destination,
-                            PortConfig &port_config, std::vector<PolicyConfig> &inline_policies) {
+                            PortConfig &port_config, std::vector<cocoon::PolicyConfig> &inline_policies) {
   auto at_parts = td::full_split(spec, '@');
   if (at_parts.size() != 2) {
     return td::Status::Error(PSLICE() << type_name << " spec must be: " << expected_format);
@@ -219,7 +264,7 @@ td::Status parse_port_spec(td::Slice spec, PortConfig &port_config) {
   // Format: port:type[:policy[:destination]]
   // Examples:
   //   8116:socks5:any
-  //   8117:reverse:tdx:localhost:8118
+  //   8117:reverse:tee:localhost:8118
 
   auto parts = td::full_split(spec, ':');
   if (parts.size() < 2) {
@@ -276,9 +321,9 @@ int main(int argc, char **argv) {
 
   option_parser.add_checked_option('P', "policy",
                                    "Define named policy: name:type[:image-hash]\n"
-                                   "  type: any|fake_tdx|tdx\n"
+                                   "  type: any|fake_tee|tee\n"
                                    "  Examples:\n"
-                                   "    strict:tdx:abc123...\n"
+                                   "    strict:tee:abc123...\n"
                                    "    relaxed:any",
                                    [&](td::Slice spec) {
                                      PolicyConfig policy_config;
@@ -289,7 +334,7 @@ int main(int argc, char **argv) {
 
   option_parser.add_checked_option('S', "socks5",
                                    "SOCKS5 proxy: port@policy[:image-hash]\n"
-                                   "  Example: 8116@tdx:abc123...",
+                                   "  Example: 8116@tee:abc123...",
                                    [&](td::Slice spec) {
                                      PortConfig port_config;
                                      TRY_STATUS(parse_socks5_spec(spec, port_config, args.cli_policies));
@@ -299,7 +344,7 @@ int main(int argc, char **argv) {
 
   option_parser.add_checked_option('F', "fwd",
                                    "Forward proxy: port:host:port@policy[:image-hash]\n"
-                                   "  Example: 8117:backend.com:443@tdx:abc123...",
+                                   "  Example: 8117:backend.com:443@tee:abc123...",
                                    [&](td::Slice spec) {
                                      PortConfig port_config;
                                      TRY_STATUS(parse_forward_spec(spec, port_config, args.cli_policies));
@@ -309,7 +354,7 @@ int main(int argc, char **argv) {
 
   option_parser.add_checked_option('R', "rev",
                                    "Reverse proxy: port:host:port@policy[:image-hash]\n"
-                                   "  Example: 8118:localhost:8080@tdx:abc123...",
+                                   "  Example: 8118:localhost:8080@tee:abc123...",
                                    [&](td::Slice spec) {
                                      PortConfig port_config;
                                      TRY_STATUS(parse_reverse_spec(spec, port_config, args.cli_policies));
@@ -407,14 +452,11 @@ int main(int argc, char **argv) {
     config = r_config.move_as_ok();
   }
   config.policies.emplace_back(
-      PolicyConfig{.name = "tdx", .type = "tdx", .description = "default tdx", .tdx_config = {}, .parameters = {}});
+      PolicyConfig{.name = "tee", .type = "tee", .description = "default tee", .ratls_policy = {}});
   config.policies.emplace_back(
-      PolicyConfig{.name = "any", .type = "any", .description = "accept any", .tdx_config = {}, .parameters = {}});
-  config.policies.emplace_back(PolicyConfig{.name = "fake_tdx",
-                                            .type = "fake_tdx",
-                                            .description = "fake tdx for testing",
-                                            .tdx_config = {},
-                                            .parameters = {}});
+      PolicyConfig{.name = "any", .type = "any", .description = "accept any", .ratls_policy = {}});
+  config.policies.emplace_back(
+      PolicyConfig{.name = "fake_tee", .type = "fake_tee", .description = "fake tee for testing", .ratls_policy = {}});
 
   // Merge CLI policies with config policies
   if (!args.cli_policies.empty()) {
@@ -424,12 +466,12 @@ int main(int argc, char **argv) {
   // Apply global collateral root hashes to all policies (if specified)
   if (!args.global_collateral_root_hashes.empty()) {
     for (auto &policy_config : config.policies) {
-      if (policy_config.type != "tdx") {
+      if (policy_config.type != "tee") {
         continue;
       }
-      policy_config.tdx_config.allowed_collateral_root_hashes.insert(
-          policy_config.tdx_config.allowed_collateral_root_hashes.end(), args.global_collateral_root_hashes.begin(),
-          args.global_collateral_root_hashes.end());
+      policy_config.ratls_policy.tdx_config.allowed_collateral_root_hashes.insert(
+          policy_config.ratls_policy.tdx_config.allowed_collateral_root_hashes.end(),
+          args.global_collateral_root_hashes.begin(), args.global_collateral_root_hashes.end());
     }
     LOG(INFO) << "Applied " << args.global_collateral_root_hashes.size()
               << " global collateral root hash(es) to all policies";
@@ -467,13 +509,16 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Start scheduler
+  td::actor::Scheduler sched{{config.threads}};
+
   // Create policies
-  auto policies = create_policies_from_config(config);
+  auto policies = create_policies_from_config(&sched, config);
 
   // Load certificate
-  tdx::CertAndKey cert_and_key;
+  cocoon::TeeCertAndKey cert_and_key;
   if (!config.cert_base_name.empty()) {
-    auto r_cert = tdx::load_cert_and_key(config.cert_base_name);
+    auto r_cert = cocoon::load_cert_and_key(config.cert_base_name);
     if (r_cert.is_error()) {
       LOG(ERROR) << "Failed to load certificate: " << r_cert.error();
       return 1;
@@ -481,13 +526,10 @@ int main(int argc, char **argv) {
     cert_and_key = r_cert.move_as_ok();
   } else {
     LOG(WARNING) << "No certificate provided, generating test certificate";
-    cert_and_key = tdx::generate_cert_and_key(nullptr);
+    cert_and_key = cocoon::generate_cert_and_key(nullptr).move_as_ok();
   }
 
-  td::SharedValue<tdx::CertAndKey> shared_cert(std::move(cert_and_key));
-
-  // Start scheduler
-  td::actor::Scheduler sched{{config.threads}};
+  td::SharedValue<cocoon::TeeCertAndKey> shared_cert(std::move(cert_and_key));
 
   sched.run_in_context([&] {
     // Start certificate manager if cert path is provided

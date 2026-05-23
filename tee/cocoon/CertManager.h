@@ -2,7 +2,7 @@
 #include "td/actor/actor.h"
 #include "td/utils/SharedValue.h"
 #include "td/utils/Time.h"
-#include "tdx.h"
+#include "tee/cocoon/Tee.h"
 
 namespace cocoon {
 
@@ -10,7 +10,7 @@ class CertManager final : public td::actor::Actor {
  public:
   struct Config {
     std::string cert_base_name;
-    td::SharedValue<tdx::CertAndKey> cert_and_key;
+    td::SharedValue<TeeCertAndKey> cert_and_key;
     double check_interval_sec{60.0};
   };
 

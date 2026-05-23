@@ -14,8 +14,6 @@ set(COCOON_SOURCE
         cocoon/AttestationCache.h
         cocoon/CertManager.cpp
         cocoon/CertManager.h
-        cocoon/tdx.cpp
-        cocoon/tdx.h
         cocoon/FwdProxy.cpp
         cocoon/FwdProxy.h
         cocoon/RevProxy.cpp
@@ -26,6 +24,41 @@ set(COCOON_SOURCE
         cocoon/utils.h
         cocoon/ProxyConfig.cpp
         cocoon/ProxyConfig.h
+        cocoon/RATLS.h
+        cocoon/RATLS.cpp
+        cocoon/Tee.h
+        cocoon/Tee.cpp
+        cocoon/tdx/tdx.cpp
+        cocoon/tdx/tdx.h
+        cocoon/tdx/PolicyConfig.cpp
+        cocoon/tdx/PolicyConfig.h
+        cocoon/tdx/RATLS.h
+        cocoon/tdx/RATLS.cpp
+        cocoon/tdx/Tee.h
+        cocoon/tdx/Tee.cpp
+        cocoon/sev/ABI.cpp
+        cocoon/sev/ABI.h
+        cocoon/sev/GuestCTX.cpp
+        cocoon/sev/GuestCTX.h
+        cocoon/sev/GuestDevice.cpp
+        cocoon/sev/GuestDevice.h
+        cocoon/sev/OVMF.cpp
+        cocoon/sev/OVMF.h
+        cocoon/sev/PKI.cpp
+        cocoon/sev/PKI.h
+        cocoon/sev/PolicyConfig.cpp
+        cocoon/sev/PolicyConfig.h
+        cocoon/sev/RATLS.cpp
+        cocoon/sev/RATLS.h
+        cocoon/sev/SEVHashes.cpp
+        cocoon/sev/SEVHashes.h
+        cocoon/sev/SHA384.h
+        cocoon/sev/Tee.cpp
+        cocoon/sev/Tee.h
+        cocoon/sev/UUID.cpp
+        cocoon/sev/UUID.h
+        cocoon/sev/VMSA.cpp
+        cocoon/sev/VMSA.h
 )
 
 set(COCOON_TEST_SOURCE
@@ -74,7 +107,7 @@ endif()
 
 
 add_library(cocoon STATIC ${COCOON_SOURCE})
-target_link_libraries(cocoon PUBLIC tdutils PRIVATE ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS} ${ZLIB_LIBRARIES} tdnet_ported ${ATTESTATION_LIBRARIES})
+target_link_libraries(cocoon PUBLIC tdutils PRIVATE ${OPENSSL_CRYPTO_LIBRARY} ${CMAKE_DL_LIBS} ${ZLIB_LIBRARIES} tdnet_ported ${ATTESTATION_LIBRARIES} cocoon_common)
 target_include_directories(cocoon SYSTEM PRIVATE $<BUILD_INTERFACE:${OPENSSL_INCLUDE_DIR}>)
 target_include_directories(cocoon PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..)
 target_include_directories(cocoon PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
@@ -100,6 +133,10 @@ target_link_libraries(router PRIVATE cocoon tdutils tdnet_ported tdactor)
 add_executable(tdx-info EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/tdx-info.cpp)
 target_link_libraries(tdx-info PRIVATE cocoon tdutils tdnet_ported tdactor)
 
+add_executable(sev-info EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/sev-info.cpp)
+target_link_libraries(sev-info PRIVATE cocoon tdutils tdnet_ported tdactor)
+target_include_directories(sev-info PUBLIC $<BUILD_INTERFACE:${TL_TD_AUTO_INCLUDE_DIR}>)
+
 add_executable(cocoon-subst EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/cocoon-subst.cpp)
 target_link_libraries(cocoon-subst PRIVATE tdutils)
 
@@ -108,7 +145,7 @@ add_executable(health-monitor EXCLUDE_FROM_ALL
   ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/health-metrics.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/health-stats.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/health-render.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/tdx-eventlog.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cocoon/tdx/eventlog.cpp
 )
 target_link_libraries(health-monitor PRIVATE cocoon tdutils tdnet_ported tdactor git)
 
@@ -116,4 +153,4 @@ add_executable(health-client EXCLUDE_FROM_ALL ${CMAKE_CURRENT_SOURCE_DIR}/cocoon
 target_link_libraries(health-client PRIVATE cocoon tdutils tdnet_ported tdactor)
 
 # SGX enclave build (self-contained, returns early if SDK not found)
-add_subdirectory(sgx-enclave)
+add_subdirectory(cocoon/tdx/sgx-enclave)

@@ -11,7 +11,7 @@ import sys
 import argparse
 
 from mt import add_translate_args
-from mt.tasks import list_tasks
+from mt.tasks import list_tasks, AUDIO_TASKS
 
 from .run import cmd_run
 from .eval import cmd_eval
@@ -44,10 +44,12 @@ Examples:
     # =========================================================================
     p_run = subparsers.add_parser("run", help="Run single inference")
     p_run.add_argument("task", choices=available_tasks, help="Task to run")
-    p_run.add_argument("input", nargs="?", help="Text to process (or use --file/stdin)")
-    p_run.add_argument("--file", "-f", help="Read input from file")
+    p_run.add_argument("input", nargs="?", help="Text to process (or use --file/stdin). For audio tasks, this is the audio file path.")
+    p_run.add_argument("--file", "-f", help="Read input from file (text file for text tasks, audio file for audio tasks)")
+    p_run.add_argument("--raw", action="store_true", help="Send raw JSON payload from --file or stdin directly to API")
     p_run.add_argument("--to", help="Target language for translate (e.g. 'ru')")
     p_run.add_argument("--lang", help="Language for summarize (default: en)")
+    p_run.add_argument("--top-k", type=int, default=5, help="Number of top predictions for audio_langid (default: 5)")
     add_translate_args(p_run)
     p_run.set_defaults(func=cmd_run)
     
@@ -66,10 +68,20 @@ Examples:
     p_eval.add_argument('configs', nargs='*', metavar='CONFIG',
                         help='Config file(s) to evaluate (INI format)')
     p_eval.add_argument('--task', type=str, default='translate',
-                        choices=['translate', 'summarize'],
+                        choices=['translate', 'summarize', 'audio_langid', 'audio_transcribe'],
                         help='Task to evaluate (default: translate)')
     p_eval.add_argument('--lang', type=str, default='en',
                         help='Language for summarize task (default: en)')
+    p_eval.add_argument('--audio-dir', type=str,
+                        help='Directory with audio files for audio_langid (structure: dir/{lang}/*.wav)')
+    p_eval.add_argument('--langs', type=str,
+                        help='Comma-separated language codes for audio_langid (e.g., "en,ru,zh")')
+    p_eval.add_argument('--audio-model', type=str, default='speechbrain',
+                        help='Model for audio_langid: "speechbrain" or "whisper" (default: speechbrain)')
+    p_eval.add_argument('--transcribe-model', type=str, default='openai/whisper-large-v3',
+                        help='Model for audio_transcribe (default: openai/whisper-large-v3)')
+    p_eval.add_argument('--transcribe-language', type=str,
+                        help='Language hint for audio_transcribe (e.g., "en", "ru"). Auto-detected from sample if not set.')
     p_eval.add_argument('--pairs', type=str,
                         help='Language pairs for translate: en-ru,en-zh')
     p_eval.add_argument('--from-csv', type=str,
@@ -136,6 +148,15 @@ Examples:
                          help='Read query from file')
     p_bench.add_argument('--csv', type=str,
                          help='Save results to CSV')
+    # Audio transcription options
+    p_bench.add_argument('--audio-dir', type=str,
+                         help='Directory with audio files for audio_transcribe benchmark')
+    p_bench.add_argument('--langs', type=str,
+                         help='Comma-separated language codes for audio (e.g., "en,ru,zh")')
+    p_bench.add_argument('--transcribe-model', type=str, default='openai/whisper-large-v3',
+                         help='Model for audio_transcribe (default: openai/whisper-large-v3)')
+    p_bench.add_argument('--transcribe-language', type=str,
+                         help='Language hint for audio_transcribe (e.g., "en", "ru")')
     p_bench.set_defaults(func=cmd_benchmark)
     
     # Parse and dispatch

@@ -1,0 +1,13 @@
+[Unit]
+Description=TDX key-manager-runner
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/key-manager-runner -c /run/spec/key-manager-config.json
+StandardOutput=journal+console
+StandardError=journal+console
+
+# Resource accounting (for health-monitor)
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes

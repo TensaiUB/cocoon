@@ -56,8 +56,9 @@ std::unique_ptr<TcpConnection::Callback> TcpClientImpl::make_tcp_connection_call
 
    public:
     void on_ready(td::actor::ActorId<TcpConnection> conn, const RemoteAppType &remote_app_type,
-                  const td::Bits256 &remote_app_hash) override {
-      td::actor::send_closure(id_, &TcpClientImpl::conn_ready, connection_id_, remote_app_type, remote_app_hash);
+                  const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) override {
+      td::actor::send_closure(id_, &TcpClientImpl::conn_ready, connection_id_, remote_app_type, remote_app_hash,
+                              verified_by);
     }
     void on_close(td::actor::ActorId<TcpConnection> conn) override {
       td::actor::send_closure(id_, &TcpClientImpl::conn_stopped, connection_id_);

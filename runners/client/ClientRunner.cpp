@@ -21,17 +21,20 @@ namespace cocoon {
  *
  */
 
-void ClientRunner::run_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
+void ClientRunner::run_http_request(http::HttpCallback::RequestType request_type,
+                                    std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                    std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                    std::unique_ptr<http::HttpRequestCallback> answer_callback) {
   auto proxy_target = get_ready_proxy_target();
   if (!proxy_target || !proxy_target->is_ready()) {
-    return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections"));
+    return http_send_static_answer(503 /* service unavailable */, "no working proxy connections",
+                                   std::move(answer_callback));
   }
 
   auto connection = get_connection(proxy_target->connection_id());
   if (!connection || !connection->is_ready()) {
-    return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections (2)"));
+    return http_send_static_answer(503 /* service unavailable */, "no working proxy connections",
+                                   std::move(answer_callback));
   }
 
   td::Bits256 request_id;
@@ -43,100 +46,70 @@ void ClientRunner::run_http_request(
   proxy->request_started();
   auto active_config_version = runner_config()->root_contract_config->version();
   auto req = td::actor::create_actor<ClientRunningRequest>(
-                 PSTRING() << "request_" << request_id.to_hex(), request_id, std::move(request), std::move(payload),
-                 std::move(promise), proxy, connection->connection_id(), proxy_conn->proto_version(),
-                 active_config_version, actor_id(this))
+                 PSTRING() << "request_" << request_id.to_hex(), request_id, request_type, std::move(headers),
+                 std::move(path), std::move(args), std::move(body), std::move(answer_callback), proxy,
+                 connection->connection_id(), proxy_conn->proto_version(), active_config_version, actor_id(this))
                  .release();
   running_queries_.emplace(request_id, req);
 }
 
-void ClientRunner::run_get_models_request(
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
+void ClientRunner::run_get_models_request(std::unique_ptr<http::HttpRequestCallback> answer_callback) {
   auto proxy_target = get_ready_proxy_target();
   if (!proxy_target || !proxy_target->is_ready()) {
-    return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections"));
+    return http_send_static_answer(503 /* service unavailable */, "no working proxy connections",
+                                   std::move(answer_callback));
   }
 
   auto connection = static_cast<ClientProxyConnection *>(get_connection(proxy_target->connection_id()));
   if (!connection || !connection->is_ready()) {
-    return promise.set_error(td::Status::Error(ton::ErrorCode::notready, "no working proxy connections (2)"));
+    return http_send_static_answer(503 /* service unavailable */, "no working proxy connections",
+                                   std::move(answer_callback));
   }
 
-  if (connection->proto_version() == 0) {
-    auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypes>();
-    send_query_to_connection(
-        proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
-        [promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
-          if (R.is_error()) {
-            ton::http::answer_error(ton::http::HttpStatusCode::status_gateway_timeout, "gateway timeout",
-                                    std::move(promise));
-            return;
-          }
+  auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypesV2>();
+  send_query_to_connection(
+      proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
+      [answer_callback = std::move(answer_callback)](td::Result<td::BufferSlice> R) mutable {
+        if (R.is_error()) {
+          return http_send_static_answer(R.move_as_error_prefix("got error from proxy: "), std::move(answer_callback));
+        }
 
-          auto b = R.move_as_ok();
-          auto obj = cocoon::fetch_tl_object<cocoon_api::client_workerTypes>(std::move(b), true).move_as_ok();
-          SimpleJsonSerializer jb;
+        auto b = R.move_as_ok();
+        auto R2 = cocoon::fetch_tl_object<cocoon_api::client_workerTypesV2>(std::move(b), true);
+        if (R2.is_error()) {
+          return http_send_static_answer(R2.move_as_error_prefix("got invalid result from proxy: "),
+                                         std::move(answer_callback));
+        }
+        auto obj = R2.move_as_ok();
+        SimpleJsonSerializer jb;
+        jb.start_object();
+        jb.add_element("object", "list");
+        jb.start_array("data");
+        for (size_t i = 0; i < obj->types_.size(); i++) {
+          auto &e = obj->types_[i];
           jb.start_object();
-          jb.add_element("object", "list");
-          jb.start_array("data");
-          for (size_t i = 0; i < obj->types_.size(); i++) {
-            auto &e = obj->types_[i];
+          jb.add_element("id", e->name_);
+          jb.add_element("object", "model");
+          jb.add_element("created", 0);
+          jb.add_element("owned_by", "?");
+          jb.start_array("workers");
+          for (auto &w : e->workers_) {
             jb.start_object();
-            jb.add_element("id", e->name_);
-            jb.add_element("object", "model");
-            jb.add_element("created", 0);
-            jb.add_element("owned_by", "?");
+            jb.add_element("coefficient", w->coefficient_);
+            jb.add_element("running_requests", w->active_requests_);
+            jb.add_element("max_running_requests", w->max_active_requests_);
             jb.stop_object();
           }
           jb.stop_array();
-          jb.add_element("object", "list");
           jb.stop_object();
+        }
+        jb.stop_array();
+        jb.add_element("object", "list");
+        jb.stop_object();
 
-          auto res = jb.as_cslice().str();
-          http_send_static_answer(std::move(res), std::move(promise), "application/json");
-        });
-  } else {
-    auto request = cocoon::create_serialize_tl_object<cocoon_api::client_getWorkerTypesV2>();
-    send_query_to_connection(
-        proxy_target->connection_id(), "request", std::move(request), td::Timestamp::in(10.0),
-        [self = this, promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
-          if (R.is_error()) {
-            self->http_send_static_answer(R.move_as_error_prefix("got error: "), std::move(promise));
-            return;
-          }
-
-          auto b = R.move_as_ok();
-          auto obj = cocoon::fetch_tl_object<cocoon_api::client_workerTypesV2>(std::move(b), true).move_as_ok();
-          SimpleJsonSerializer jb;
-          jb.start_object();
-          jb.add_element("object", "list");
-          jb.start_array("data");
-          for (size_t i = 0; i < obj->types_.size(); i++) {
-            auto &e = obj->types_[i];
-            jb.start_object();
-            jb.add_element("id", e->name_);
-            jb.add_element("object", "model");
-            jb.add_element("created", 0);
-            jb.add_element("owned_by", "?");
-            jb.start_array("workers");
-            for (auto &w : e->workers_) {
-              jb.start_object();
-              jb.add_element("coefficient", w->coefficient_);
-              jb.add_element("running_requests", w->active_requests_);
-              jb.add_element("max_running_requests", w->max_active_requests_);
-              jb.stop_object();
-            }
-            jb.stop_array();
-            jb.stop_object();
-          }
-          jb.stop_array();
-          jb.add_element("object", "list");
-          jb.stop_object();
-
-          auto res = jb.as_cslice().str();
-          http_send_static_answer(std::move(res), std::move(promise), "application/json");
-        });
-  }
+        auto res = jb.as_cslice().str();
+        http_send_static_answer(std::move(res), std::move(answer_callback), "application/json");
+      });
 }
 
 void ClientRunner::finish_request(td::Bits256 request_id, std::shared_ptr<ClientProxyInfo> proxy) {
@@ -179,17 +152,13 @@ void ClientRunner::load_config(td::Promise<td::Unit> promise) {
     if (conf.connect_to_proxy_via_.size() > 0) {
       TRY_STATUS(connection_to_proxy_via(conf.connect_to_proxy_via_));
     }
-    if (conf.check_proxy_hashes_ || !conf.is_test_) {
-      set_fake_tdx(false);
-      enable_check_proxy_hash();
-    } else {
-      set_fake_tdx(true);
-    }
+
+    set_check_image_hashes(conf.check_proxy_hashes_ || !conf.is_test_);
+    set_fake_tee(!check_image_hashes());
     set_secret_string(td::SecureString(conf.secret_string_));
     set_number_of_proxy_connections(conf.proxy_connections_, true);
     set_owner_address(owner_address);
     set_http_access_hash(conf.http_access_hash_);
-    set_fake_tdx(!check_proxy_hash_);
     set_is_test(conf.is_test_);
     return td::Status::OK();
   }();
@@ -212,59 +181,62 @@ void ClientRunner::custom_initialize(td::Promise<td::Unit> promise) {
         promise.set_value(td::Unit());
       });
 
-  register_custom_http_handler(
-      "/stats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_generate_main(), std::move(promise)); });
+  register_custom_http_handler("/stats", [&](http::HttpCallback::RequestType request_type,
+                                             std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                             std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                             std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+    http_send_static_answer(http_generate_main(), std::move(answer_callback));
+  });
   register_custom_http_handler(
       "/jsonstats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        http_send_static_answer(http_generate_json_stats(), std::move(promise), "application/json");
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_generate_json_stats(), std::move(answer_callback), "application/json");
       });
   register_custom_http_handler(
       "/request/charge",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_charge(get_args["proxy"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_charge(get_from_sorted_list(args, "proxy")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/close",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_close(get_args["proxy"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_close(get_from_sorted_list(args, "proxy")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/topup",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_top_up(get_args["proxy"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_top_up(get_from_sorted_list(args, "proxy")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/withdraw",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_withdraw(get_args["proxy"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_withdraw(get_from_sorted_list(args, "proxy")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/debuglogentry",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        http_send_static_answer(http_get_request_debug_info(get_args["request_guid"]), std::move(promise),
-                                "application/json");
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_get_request_debug_info(get_from_sorted_list(args, "request_guid")),
+                                std::move(answer_callback), "application/json");
       });
   register_custom_http_handler(
       "/favicon.ico",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { promise.set_error(td::Status::Error(ton::ErrorCode::error, "not found")); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(404 /*not found*/, "", std::move(answer_callback), "application/json");
+      });
 }
 
 /* 
@@ -324,7 +296,12 @@ void ClientRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
     case cocoon_api::client_queryAnswerEx::ID:
     case cocoon_api::client_queryAnswerPartEx::ID:
     case cocoon_api::client_queryAnswerErrorEx::ID: {
-      auto obj = cocoon::fetch_tl_object<cocoon_api::client_QueryAnswerEx>(std::move(query), true).move_as_ok();
+      auto R = cocoon::fetch_tl_object<cocoon_api::client_QueryAnswerEx>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       td::Bits256 request_id;
       cocoon_api::downcast_call(*obj, [&](auto &e) { request_id = e.request_id_; });
       auto it = running_queries_.find(request_id);
@@ -336,6 +313,7 @@ void ClientRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
     case cocoon_api::proxy_signedPayment::ID: {
       auto R = cocoon::fetch_tl_object<cocoon_api::proxy_signedPayment>(std::move(query), true);
       if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
         return;
       }
       auto conn = static_cast<ClientProxyConnection *>(get_connection(connection_id));
@@ -348,6 +326,7 @@ void ClientRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
     case cocoon_api::proxy_clientRequestPayment::ID: {
       auto R = cocoon::fetch_tl_object<cocoon_api::proxy_clientRequestPayment>(std::move(query), true);
       if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
         return;
       }
       auto obj = R.move_as_ok();
@@ -366,25 +345,21 @@ void ClientRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
   };
 }
 
-void ClientRunner::receive_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  if (request->method() == "OPTIONS") {
-    // TODO: return 204
-    std::string data = "<http><body>OK</body></http>";
-    http_send_static_answer(std::move(data), std::move(promise));
-    return;
-  }
-  if (request->url() == "/v1/models") {
-    if (payload->payload_type() != ton::http::HttpPayload::PayloadType::pt_empty) {
-      ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
+void ClientRunner::receive_http_request(http::HttpCallback::RequestType request_type,
+                                        std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                        std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                        std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+  if (path == "/v1/models") {
+    if (body.size() != 0) {
+      http_send_static_answer(400, "bad request", std::move(answer_callback));
       return;
     }
-    run_get_models_request(std::move(promise));
+    run_get_models_request(std::move(answer_callback));
     return;
   }
 
-  run_http_request(std::move(request), std::move(payload), std::move(promise));
+  run_http_request(request_type, std::move(headers), std::move(path), std::move(args), std::move(body),
+                   std::move(answer_callback));
 }
 
 /*
@@ -603,7 +578,7 @@ std::string ClientRunner::http_generate_main() {
     sb << "<table>\n";
     sb << "<tr><td>root address</td><td>" << address_link(root_contract_address()) << "</td></tr>\n";
     sb << "<tr><td>owner address</td><td>" << address_link(owner_address()) << "</td></tr>\n";
-    sb << "<tr><td>check proxy hash</td><td>" << (check_proxy_hash_ ? "YES" : "NO") << "</td></tr>\n";
+    sb << "<tr><td>check proxy hash</td><td>" << (check_image_hashes() ? "YES" : "NO") << "</td></tr>\n";
     sb << "</table>\n";
   }
 
@@ -661,7 +636,7 @@ std::string ClientRunner::http_generate_json_stats() {
   {
     jb.start_object("stats");
     stats_->requests_received.to_jb(jb, "queries");
-    stats_->requests_failed.to_jb(jb, "success");
+    stats_->requests_success.to_jb(jb, "success");
     stats_->requests_failed.to_jb(jb, "failed");
     stats_->request_bytes_received.to_jb(jb, "bytes_received");
     stats_->answer_bytes_sent.to_jb(jb, "bytes_sent");
@@ -673,7 +648,7 @@ std::string ClientRunner::http_generate_json_stats() {
     jb.start_object("localconf");
     jb.add_element("root_address", root_contract_address().rserialize(true));
     jb.add_element("owner_address", owner_address().rserialize(true));
-    jb.add_element("check_proxy_hash", check_proxy_hash_);
+    jb.add_element("check_image_hashes", check_image_hashes());
     jb.stop_object();
   }
 

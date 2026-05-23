@@ -26,7 +26,8 @@
 #include "td/utils/port/IPAddress.h"
 #include "td/actor/actor.h"
 #include "crypto/common/bitstring.h"
-#include "tee/cocoon/tdx.h"
+#include "tee/cocoon/Tee.h"
+#include "tee/cocoon/RATLS.h"
 #include <memory>
 #include <vector>
 
@@ -41,11 +42,11 @@ struct TcpConnectionSocks5 {
   td::IPAddress connect_via;
 };
 struct TcpConnectionTls {
-  TcpConnectionTls(tdx::CertAndKey cert_and_key, tdx::PolicyRef policy)
+  TcpConnectionTls(TeeCertAndKey cert_and_key, RATLSPolicyRef policy)
       : cert_and_key(std::move(cert_and_key)), policy(std::move(policy)) {
   }
-  tdx::CertAndKey cert_and_key;
-  tdx::PolicyRef policy;
+  TeeCertAndKey cert_and_key;
+  RATLSPolicyRef policy;
 };
 
 struct TcpConnectionType {
@@ -81,9 +82,10 @@ class TcpClient : public td::actor::Actor {
    public:
     virtual ~Callback() = default;
     virtual void on_ready_outbound(ConnectionId connection_id, TargetId target_id, const RemoteAppType &remote_app_type,
-                                   const td::Bits256 &remote_app_hash) = 0;
+                                   const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) = 0;
     virtual void on_ready_inbound(ConnectionId connection_id, ListeningSocketId listening_socket_id,
-                                  const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) = 0;
+                                  const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                                  const td::Bits256 &verified_by) = 0;
     virtual void on_stop_ready(ConnectionId connection_id) = 0;
     virtual void receive_message(ConnectionId connection_id, td::BufferSlice message) = 0;
     virtual void receive_query(ConnectionId connection_id, td::BufferSlice message,

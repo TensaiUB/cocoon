@@ -1,0 +1,15 @@
+{
+  "is_test": "$IS_DEBUG",
+  "is_testnet" : false,
+  "check_hashes" : false,
+  "add_default_key" : "$IS_DEBUG",
+  "http_port" : 13000,
+  "rpc_port"  : 13101,
+  "ton_config_filename": "$TON_CONFIG_FILE",
+  "owner_address": "$OWNER_ADDRESS",
+  "image_hash": "$TEE_IMAGE_HASH",
+  "node_wallet_key": "$NODE_WALLET_KEY",
+  "root_contract_address": "$ROOT_CONTRACT_ADDRESS",
+  "machine_specific_private_key": "$APP_KEY",
+  "db_path": "$DISK_PATH/key-manager-db"
+}

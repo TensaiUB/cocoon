@@ -1,5 +1,5 @@
 #!/bin/bash
-# build-image - Build COCOON TDX VM image using mkosi
+# build-image - Build COCOON TEE VM image using mkosi
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [OPTIONS] [prod|test]"
             echo ""
-            echo "Build COCOON TDX VM image using mkosi"
+            echo "Build COCOON TEE VM image using mkosi"
             echo ""
             echo "Options:"
             echo "  --fast, --incremental    Incremental build (reuse artifacts, faster)"
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo "=== Building COCOON TDX Image ($BUILD_TYPE) ==="
+echo "=== Building COCOON TEE Image ($BUILD_TYPE) ==="
 
 # Check/setup mkosi in venv
 if [[ ! -d venv ]]; then

@@ -3,8 +3,11 @@
 
 #include "auto/tl/cocoon_api.h"
 #include "checksum.h"
+#include "cocoon-tl-utils/cocoon-common-utils.hpp"
 #include "cocoon-tl-utils/cocoon-tl-utils.hpp"
+#include "common/bitstring.h"
 #include "errorcode.h"
+#include "nlohmann/json_fwd.hpp"
 #include "runners/helpers/HttpSender.hpp"
 
 #include "git.h"
@@ -21,6 +24,14 @@
 #include "tl/tl/tl_json.h"
 #include "auto/tl/cocoon_api_json.h"
 #include <memory>
+
+#if __has_include(<unistd.h>)
+#include <unistd.h>
+#include <sys/wait.h>
+#define HAS_UNISTD 1
+#else
+#define HAS_UNISTD 0
+#endif
 
 namespace cocoon {
 
@@ -51,29 +62,26 @@ void WorkerRunner::receive_request(WorkerProxyInfo &proxy, TcpClient::Connection
   }
   auto proto_version = conn->proto_version();
   if (active_requests_ >= max_active_requests_) {
-    td::BufferSlice res;
-    if (proto_version == 0) {
-      res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerError>(
-          ton::ErrorCode::error, "too many active queries", req.request_id_,
-          ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0));
-    } else {
-      res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerErrorEx>(
-          req.request_id_, ton::ErrorCode::error, "too many active queries", 1,
-          ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
-              (proto_version >= 2 ? 2 : 0), ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0), "",
-              td::Clocks::system(), td::Clocks::system()));
-    }
+    td::BufferSlice res = cocoon::create_serialize_tl_object<cocoon_api::proxy_queryAnswerErrorEx>(
+        req.request_id_, ton::ErrorCode::error, "too many active queries", 1,
+        ton::create_tl_object<cocoon_api::proxy_queryFinalInfo>(
+            (proto_version >= 2 ? 2 : 0), ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0), "",
+            td::Clocks::system(), td::Clocks::system()));
     send_message_to_connection(connection_id, std::move(res));
     return;
+  }
+
+  if (!(req.flags_ & 2)) {
+    req.private_key_ = td::Bits256::zero();
   }
 
   proxy.update_payment_info(std::move(req.signed_payment_));
   active_requests_++;
 
-  td::actor::create_actor<WorkerRunningRequest>(PSTRING() << "request_" << req.request_id_.to_hex(), req.request_id_,
-                                                connection_id, std::move(req.query_), req.timeout_, model_base_name(),
-                                                req.coefficient_, proto_version, (req.flags_ & 1) && req.enable_debug_,
-                                                proxy.sc()->runner_config(), actor_id(this), stats_)
+  td::actor::create_actor<WorkerRunningRequest>(
+      PSTRING() << "request_" << req.request_id_.to_hex(), req.request_id_, connection_id, std::move(req.query_),
+      req.private_key_, req.timeout_, forward_requests_to_, model_base_name(), req.coefficient_, proto_version,
+      (req.flags_ & 1) && req.enable_debug_, proxy.sc()->runner_config(), actor_id(this), scheduler(), stats_)
       .release();
 }
 
@@ -118,9 +126,7 @@ void WorkerRunner::load_config(td::Promise<td::Unit> promise) {
     TRY_STATUS(connection_to_proxy_via(conf.connect_to_proxy_via_));
 
     local_image_hash_unverified_ = conf.image_hash_;
-    if (conf.check_proxy_hashes_ || !conf.is_test_) {
-      enable_check_proxy_hash();
-    }
+    set_check_image_hashes(conf.check_proxy_hashes_ || !conf.is_test_);
 
     TRY_STATUS(create_http_client(conf.forward_requests_to_));
     set_model_name(conf.model_name_);
@@ -130,6 +136,16 @@ void WorkerRunner::load_config(td::Promise<td::Unit> promise) {
     if (conf.max_active_requests_ > 0) {
       set_max_active_requests(conf.max_active_requests_);
     }
+
+    change_model_script_ = conf.change_model_script_;
+    machine_description_json_ = conf.machine_description_json_;
+
+    if (machine_description_json_.size() == 0) {
+      machine_description_json_ = "{}";
+    }
+
+    auto r = nlohmann::json::parse(machine_description_json_);
+    CHECK(r.is_object());
 
     return td::Status::OK();
   }();
@@ -176,55 +192,47 @@ td::Status WorkerRunner::create_http_client(td::Slice S) {
 void WorkerRunner::custom_initialize(td::Promise<td::Unit> promise) {
   params_version_ = runner_config()->root_contract_config->params_version();
 
-  register_custom_http_handler(
-      "/stats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_generate_main(), std::move(promise)); });
-
+  register_custom_http_handler("/stats", [&](http::HttpCallback::RequestType request_type,
+                                             std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                             std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                             std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+    http_send_static_answer(http_generate_main(), std::move(answer_callback));
+  });
   register_custom_http_handler(
       "/jsonstats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        http_send_static_answer(http_generate_json_stats(), std::move(promise), "application/json");
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_generate_json_stats(), std::move(answer_callback), "application/json");
       });
-
   register_custom_http_handler(
       "/request/payout",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_payout(get_args["proxy"]), std::move(promise)); });
-
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_payout(get_from_sorted_list(args, "proxy")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/enable",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_worker_set_force_disabled(false), std::move(promise)); });
-
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_worker_set_force_disabled(false), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/disable",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_worker_set_force_disabled(true), std::move(promise)); });
-
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_worker_set_force_disabled(true), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/change_coefficient",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        auto it = get_args.find("coefficient");
-        if (it != get_args.end()) {
-          http_send_static_answer(http_worker_change_coefficient(it->second), std::move(promise));
-        } else {
-          http_send_static_answer(http_worker_change_coefficient(), std::move(promise));
-        }
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_worker_change_coefficient(get_from_sorted_list(args, "coefficient")),
+                                std::move(answer_callback));
       });
 
   cocoon_wallet_initialize_wait_for_balance_and_get_seqno(
@@ -237,7 +245,8 @@ void WorkerRunner::custom_initialize(td::Promise<td::Unit> promise) {
         promise.set_value(td::Unit());
       });
 
-  td::actor::create_actor<WorkerUplinkMonitor>("uplinkmonitor", actor_id(this)).release();
+  td::actor::create_actor<WorkerUplinkMonitor>("uplinkmonitor", forward_requests_to_, actor_id(this), scheduler())
+      .release();
 }
 
 /*
@@ -253,7 +262,7 @@ void WorkerRunner::alarm() {
     close_all_connections();
     params_version_ = runner_config()->root_contract_config->params_version();
   }
-  if (need_check_proxy_hash()) {
+  if (check_image_hashes()) {
     auto c = runner_config();
     if (c) {
       CHECK(c->root_contract_config->has_worker_hash(local_image_hash_unverified_));
@@ -325,19 +334,34 @@ void WorkerRunner::receive_message(TcpClient::ConnectionId connection_id, td::Bu
     } break;
     case cocoon_api::proxy_runQuery::ID: {
       proxy->received_request_from_proxy();
-      auto obj = fetch_tl_object<cocoon_api::proxy_runQuery>(query, true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_runQuery>(query, true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       auto ex_obj = ton::create_tl_object<cocoon_api::proxy_runQueryEx>(
           std::move(obj->query_), std::move(obj->signed_payment_), obj->coefficient_, obj->timeout_, obj->request_id_,
-          0, false);
+          0, false, td::Bits256::zero());
       receive_request(*proxy, connection_id, *ex_obj);
     } break;
     case cocoon_api::proxy_runQueryEx::ID: {
       proxy->received_request_from_proxy();
-      auto obj = fetch_tl_object<cocoon_api::proxy_runQueryEx>(query, true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_runQueryEx>(query, true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       receive_request(*proxy, connection_id, *obj);
     } break;
     case cocoon_api::proxy_workerRequestPayment::ID: {
-      auto obj = fetch_tl_object<cocoon_api::proxy_workerRequestPayment>(query, true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_workerRequestPayment>(query, true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from proxy: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       /* we already have newer information. This shouldn't happen, so close we close the connection
        * in order to restart a handshake to compare information*/
       if (!proxy->update_payment_info(std::move(obj->signed_payment_))) {
@@ -373,16 +397,15 @@ void WorkerRunner::receive_query(TcpClient::ConnectionId connection_id, td::Buff
 
   auto magic = get_tl_magic(query);
   switch (magic) {
+    case cocoon_api::worker_changeModel::ID: {
+      TRY_RESULT_PROMISE(promise, obj, cocoon::fetch_tl_object<cocoon_api::worker_changeModel>(std::move(query), true));
+      TRY_STATUS_PROMISE(promise, change_model(obj->new_model_));
+      promise.set_value(cocoon::create_serialize_tl_object<cocoon_api::worker_changedModel>());
+      return;
+    }
     default:
       LOG(ERROR) << "dropping received query: received query with unknown magic " << td::format::as_hex(magic);
   }
-}
-
-void WorkerRunner::receive_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  /* 404 */
-  ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "not found", std::move(promise));
 }
 
 /*
@@ -497,6 +520,36 @@ void WorkerRunner::set_coefficient(td::int32 value) {
   });
 }
 
+td::Status WorkerRunner::change_model(std::string new_model) {
+  if (change_model_script_.size() == 0) {
+    return td::Status::Error(ton::ErrorCode::error, "cannot change model: no script in config");
+  } else if (!HAS_UNISTD) {
+    return td::Status::Error(ton::ErrorCode::error, "cannot change model: cannot exec");
+  } else {
+    if (check_image_hashes()) {
+      if (!runner_config() || !runner_config()->root_contract_config->has_model_hash(td::sha256_bits256(new_model))) {
+        return td::Status::Error(ton::ErrorCode::error, "cannot change model: unknown model");
+      }
+    }
+#if HAS_UNISTD
+    LOG(WARNING) << "changing model to " << new_model;
+    auto v = vfork();
+    if (!v) {
+      execl(change_model_script_.c_str(), change_model_script_.c_str(), new_model.c_str(), NULL);
+      _Exit(77);  // in case execl failed. In vform we can't really handle exec errors
+    } else {
+      int wstatus = 0;
+      auto r = waitpid(v, &wstatus, 0);
+      if (r < 0 || !WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+        return td::Status::Error(ton::ErrorCode::error, "cannot change model: model change script failed");
+      } else {
+        return td::Status::OK();
+      }
+    }
+#endif
+  }
+}
+
 /*
  *
  * UPLINK
@@ -545,7 +598,7 @@ std::string WorkerRunner::http_generate_main() {
       if (is_valid) {
         sb << "<span style=\"background-color:Green;\">our hash " << local_image_hash_unverified_.to_hex()
            << " is in root contract</span>";
-      } else if (need_check_proxy_hash_) {
+      } else if (check_image_hashes()) {
         sb << "<span style=\"background-color:Crimson;\">our hash " << local_image_hash_unverified_.to_hex()
            << " not found in root contract</span>";
       } else {
@@ -559,7 +612,7 @@ std::string WorkerRunner::http_generate_main() {
       bool is_valid = runner_config()->root_contract_config->has_model_hash(td::sha256_bits256(model_name_));
       if (is_valid) {
         sb << "<span style=\"background-color:Green;\">our model " << model_name_ << " is in root contract</span>";
-      } else if (need_check_proxy_hash_) {
+      } else if (check_image_hashes()) {
         sb << "<span style=\"background-color:Crimson;\">our model " << model_name_
            << " not found in root contract</span>";
       } else {
@@ -626,7 +679,7 @@ std::string WorkerRunner::http_generate_main() {
        << " <a href=\"/request/change_coefficient\">change</a></td></tr>\n";
     sb << "<tr><td>max_active_requests</td><td>" << max_active_requests_ << "</td></tr>\n";
     sb << "<tr><td>active_requests</td><td>" << active_requests_ << "</td></tr>\n";
-    sb << "<tr><td>check proxy hash</td><td>" << (need_check_proxy_hash_ ? "YES" : "NO") << "</td></tr>\n";
+    sb << "<tr><td>check proxy hash</td><td>" << (check_image_hashes() ? "YES" : "NO") << "</td></tr>\n";
     sb << "</table>\n";
   }
   store_root_contract_stat(sb);
@@ -669,13 +722,13 @@ std::string WorkerRunner::http_generate_json_stats() {
     if (cocoon_wallet()) {
       jb.add_element("wallet_balance", cocoon_wallet()->balance());
     }
-    if (need_check_proxy_hash_ && runner_config()) {
+    if (check_image_hashes() && runner_config()) {
       jb.add_element("actual_image_hash",
                      runner_config()->root_contract_config->has_worker_hash(local_image_hash_unverified_));
     } else {
       jb.add_element("actual_image_hash", true);
     }
-    if (need_check_proxy_hash_ && runner_config()) {
+    if (check_image_hashes() && runner_config()) {
       jb.add_element("actual_model",
                      runner_config()->root_contract_config->has_model_hash(td::sha256_bits256(model_name_)));
     } else {
@@ -712,7 +765,7 @@ std::string WorkerRunner::http_generate_json_stats() {
     jb.add_element("owner_address", owner_address().rserialize(true));
     jb.add_element("model", model_name_);
     jb.add_element("coefficient", coefficient_);
-    jb.add_element("check_proxy_hash", need_check_proxy_hash_);
+    jb.add_element("check_image_hashes", check_image_hashes());
     jb.stop_object();
   }
   store_root_contract_stat(jb);

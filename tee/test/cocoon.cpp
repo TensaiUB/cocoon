@@ -15,7 +15,7 @@
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/UInt.h"
 
-#include <cocoon/tdx.h>
+#include "td/cocoon/tdx/tdx.h"
 
 // Let's simplify attestation api
 void start_ping_connection(td::BufferedFd<td::SocketFd> fd, bool expect_quote_info = false) {

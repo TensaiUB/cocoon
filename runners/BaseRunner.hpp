@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Ed25519.h"
+#include "auto/tl/cocoon_api.h"
 #include "auto/tl/tonlib_api.h"
 #include "checksum.h"
 #include "common/bitstring.h"
@@ -15,23 +16,30 @@
 #include "td/utils/StringBuilder.h"
 #include "td/utils/Time.h"
 #include "td/utils/UInt.h"
+#include "td/utils/buffer.h"
 #include "td/utils/common.h"
 #include "td/utils/format.h"
+#include "td/utils/port/Clocks.h"
 #include "td/utils/port/IPAddress.h"
 #include "tl/TlObject.h"
 #include "ton/tonlib/tonlib/TonlibClient.h"
 #include "net/TcpClient.h"
-#include "http/http-server.h"
+#include "boost-http/http.h"
 #include "crypto/block/block.h"
 #include "td/utils/as.h"
 #include "vm/cells/Cell.h"
 #include "runners/smartcontracts/RootContractConfig.hpp"
 #include "runners/smartcontracts/SmartContract.hpp"
 #include "runners/smartcontracts/CocoonWallet.hpp"
+#include "cocoon-tl-utils/cocoon-tl-utils.hpp"
 #include "TonlibWrapper.h"
 #include "helpers/Ton.h"
 #include "helpers/SimpleJsonSerializer.hpp"
+#include "tee/cocoon/RATLS.h"
+#include "tee/cocoon/sev/Tee.h"
+#include "tee/cocoon/tdx/Tee.h"
 
+#include <algorithm>
 #include <csignal>
 #include <functional>
 #include <memory>
@@ -48,14 +56,20 @@ enum class ProxyTargetStatus { Connecting, RunningInitialHandshake, Reconnecting
 
 enum class ClientCheckResult { Ok, Delete };
 
+enum class RunnerRole { Worker, Proxy, Client, KeyManager, Unknown };
+
 RemoteAppType remote_app_type_proxy();
 RemoteAppType remote_app_type_worker();
+RemoteAppType remote_app_type_key_manager();
 RemoteAppType remote_app_type_unknown();
 
-using HttpHandler = std::function<void(
-    std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-    std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise)>;
+using HttpHandler = std::function<void(http::HttpCallback::RequestType request_type,
+                                       std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                       std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                       std::unique_ptr<http::HttpRequestCallback> answer_callback)>;
+
+const std::string &get_from_sorted_list(const std::vector<std::pair<std::string, std::string>> &vec,
+                                        const std::string &name);
 
 class BaseConnection {
  public:
@@ -83,13 +97,18 @@ class BaseConnection {
   const auto &remote_app_hash() const {
     return remote_app_hash_;
   }
+  const auto &verified_by() const {
+    return verified_by_;
+  }
 
   BaseConnection(BaseRunner *runner, bool is_outbound, const RemoteAppType &remote_app_type,
-                 const td::Bits256 &remote_app_hash, TcpClient::ConnectionId connection_id)
+                 const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by,
+                 TcpClient::ConnectionId connection_id)
       : runner_(runner)
       , is_outbound_(is_outbound)
       , remote_app_type_(remote_app_type)
       , remote_app_hash_(remote_app_hash)
+      , verified_by_(verified_by)
       , connection_id_(connection_id)
       , status_(BaseConnectionStatus::Connected) {
     last_status_change_at_ = td::Timestamp::now();
@@ -139,6 +158,7 @@ class BaseConnection {
   bool is_outbound_;
   RemoteAppType remote_app_type_;
   td::Bits256 remote_app_hash_;
+  td::Bits256 verified_by_;
   TcpClient::ConnectionId connection_id_;
   BaseConnectionStatus status_;
   td::int64 queries_sent_{0};
@@ -150,16 +170,16 @@ class BaseConnection {
 class BaseInboundConnection : public BaseConnection {
  public:
   BaseInboundConnection(BaseRunner *runner, const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
-                        TcpClient::ConnectionId connection_id)
-      : BaseConnection(runner, false, remote_app_type, remote_app_hash, connection_id) {
+                        const td::Bits256 &verified_by, TcpClient::ConnectionId connection_id)
+      : BaseConnection(runner, false, remote_app_type, remote_app_hash, verified_by, connection_id) {
   }
 };
 
 class BaseOutboundConnection : public BaseConnection {
  public:
   BaseOutboundConnection(BaseRunner *runner, const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
-                         TcpClient::ConnectionId connection_id)
-      : BaseConnection(runner, true, remote_app_type, remote_app_hash, connection_id) {
+                         const td::Bits256 &verified_by, TcpClient::ConnectionId connection_id)
+      : BaseConnection(runner, true, remote_app_type, remote_app_hash, verified_by, connection_id) {
   }
 
   void start_up() override {
@@ -173,8 +193,10 @@ class BaseOutboundConnection : public BaseConnection {
 class ProxyOutboundConnection : public BaseOutboundConnection {
  public:
   ProxyOutboundConnection(BaseRunner *runner, const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
-                          TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id)
-      : BaseOutboundConnection(runner, remote_app_type, remote_app_hash, connection_id), target_id_(target_id) {
+                          const td::Bits256 &verified_by, TcpClient::ConnectionId connection_id,
+                          TcpClient::TargetId target_id)
+      : BaseOutboundConnection(runner, remote_app_type, remote_app_hash, verified_by, connection_id)
+      , target_id_(target_id) {
   }
 
   void send_handshake() override {
@@ -253,6 +275,19 @@ class ProxyTarget {
   td::Timestamp last_ready_at_;
 };
 
+class KeyManagerOutboundConnection : public BaseOutboundConnection {
+ public:
+  KeyManagerOutboundConnection(BaseRunner *runner, const RemoteAppType &remote_app_type,
+                               const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by,
+                               TcpClient::ConnectionId connection_id, RunnerRole role)
+      : BaseOutboundConnection(runner, remote_app_type, remote_app_hash, verified_by, connection_id)
+      , role_(std::move(role)) {
+  }
+
+ private:
+  RunnerRole role_;
+};
+
 class DelayedAction {
  public:
   virtual ~DelayedAction() = default;
@@ -308,6 +343,12 @@ inline bool rdeserialize(block::StdAddress &addr, td::Slice s, bool is_tesnet) {
 
   return true;
 }
+
+struct BaseRunnerPrivateKey {
+  td::Bits256 private_key;
+  td::Bits256 public_key;
+  td::int32 expire_at;
+};
 
 class BaseRunner : public td::actor::Actor {
  private:
@@ -394,10 +435,20 @@ class BaseRunner : public td::actor::Actor {
   bool rdeserialize(block::StdAddress &addr, td::Slice s) const {
     return cocoon::rdeserialize(addr, s, is_testnet());
   }
+  bool check_image_hashes() const {
+    return check_image_hashes_;
+  }
+  bool check_image_is_verified() const {
+    return false;
+  }
+  auto scheduler() const {
+    return scheduler_;
+  }
+  td::Status check_verification_key(const RemoteAppType &app_type, const td::Bits256 &verified_by);
 
   /* Setters */
-  void set_fake_tdx(bool value) {
-    fake_tdx_ = value;
+  void set_fake_tee(bool value) {
+    fake_tee_ = value;
   }
   void set_http_port(td::uint16 port) {
     http_port_ = port;
@@ -436,9 +487,13 @@ class BaseRunner : public td::actor::Actor {
   void set_is_test(bool value) {
     is_test_ = value;
   }
+  void set_check_image_hashes(bool value) {
+    check_image_hashes_ = value;
+  }
 
   /* main */
-  BaseRunner(std::string engine_config_filename) : engine_config_filename_(std::move(engine_config_filename)) {
+  BaseRunner(RunnerRole role, std::string engine_config_filename, td::actor::Scheduler *scheduler)
+      : role_(std::move(role)), engine_config_filename_(std::move(engine_config_filename)), scheduler_(scheduler) {
   }
 
   /* initialize */
@@ -530,24 +585,26 @@ class BaseRunner : public td::actor::Actor {
   /* connections */
   virtual std::unique_ptr<ProxyOutboundConnection> allocate_proxy_outbound_connection(
       TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id, const RemoteAppType &remote_app_type,
-      const td::Bits256 &remote_app_hash) {
+      const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) {
     return nullptr;
   }
   virtual std::unique_ptr<BaseOutboundConnection> allocate_nonproxy_outbound_connection(
       TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id, const RemoteAppType &remote_app_type,
-      const td::Bits256 &remote_app_hash) {
+      const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) {
     return nullptr;
   }
   virtual std::unique_ptr<BaseInboundConnection> allocate_inbound_connection(
       TcpClient::ConnectionId connection_id, TcpClient::ListeningSocketId listening_socket_id,
-      const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) {
+      const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) {
     return nullptr;
   }
   //void connect_to_proxy(td::IPAddress address, td::Bits256 hash);
   void inbound_connection_ready(TcpClient::ConnectionId connection_id, TcpClient::ListeningSocketId listening_socket_id,
-                                const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash);
+                                const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                                const td::Bits256 &verified_by);
   void outbound_connection_ready(TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id,
-                                 const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash);
+                                 const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                                 const td::Bits256 &verified_by);
   void conn_stop_ready(TcpClient::ConnectionId connection_id);
   std::unique_ptr<TcpClient::Callback> make_tcp_client_callback();
   BaseConnection *get_connection(TcpClient::ConnectionId connection_id) {
@@ -591,6 +648,27 @@ class BaseRunner : public td::actor::Actor {
       delayed_action_queue_.emplace(std::make_unique<DelayedActionRunnable<F>>(at, std::move(run)));
     }
   }
+  void gc_cocoon_pk() {
+    auto it = cocoon_pk_map_.begin();
+    while (it != cocoon_pk_map_.end()) {
+      if (it->second->expire_at < td::Clocks::system()) {
+        it = cocoon_pk_map_.erase(it);
+      } else {
+        it++;
+      }
+    }
+  }
+  void get_private_keys_from_key_manager();
+  void got_private_keys_from_key_manager(td::BufferSlice R);
+  bool get_private_key(const td::Bits256 &pub, td::Bits256 &to) {
+    auto it = cocoon_pk_map_.find(pub);
+    if (it != cocoon_pk_map_.end()) {
+      to = it->second->private_key;
+      return true;
+    } else {
+      return false;
+    }
+  }
 
   /* handlers*/
   virtual void receive_message(TcpClient::ConnectionId connection_id, td::BufferSlice query) {
@@ -598,29 +676,23 @@ class BaseRunner : public td::actor::Actor {
   virtual void receive_query(TcpClient::ConnectionId connection_id, td::BufferSlice query,
                              td::Promise<td::BufferSlice> promise) {
   }
-  void receive_http_request_outer(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-          promise);
-  virtual void receive_http_request(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-          promise);
+  void receive_http_request_outer(http::HttpCallback::RequestType request_type,
+                                  std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                  std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                  std::unique_ptr<http::HttpRequestCallback> answer_callback);
+  virtual void receive_http_request(http::HttpCallback::RequestType request_type,
+                                    std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                    std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                    std::unique_ptr<http::HttpRequestCallback> answer_callback);
 
   /* http */
-  static td::Result<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-  http_gen_static_answer(td::Result<td::BufferSlice> R, std::string content_type = "text/html; charset=utf-8");
-  static void http_send_static_answer(
-      td::Result<td::BufferSlice> R,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise,
-      std::string content_type = "text/html; charset=utf-8");
-  struct HttpUrlInfo {
-    std::string url;
-    std::map<std::string, std::string> get_args;
-  };
-  td::actor::Task<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-  generate_perf_stats(::cocoon::BaseRunner::HttpUrlInfo info);
-  static td::Result<HttpUrlInfo> http_parse_url(std::string url);
+  static void http_send_static_answer(td::int32 code, std::string text,
+                                      std::unique_ptr<http::HttpRequestCallback> answer_callback,
+                                      std::string content_type = "text/html; charset=utf-8");
+  static void http_send_static_answer(td::Result<td::BufferSlice> R,
+                                      std::unique_ptr<http::HttpRequestCallback> answer_callback,
+                                      std::string content_type = "text/html; charset=utf-8");
+  td::actor::Task<td::Unit> generate_perf_stats(std::unique_ptr<http::HttpRequestCallback> answer_callback);
   void register_custom_http_handler(std::string url, HttpHandler handler) {
     CHECK(custom_http_handlers_.emplace(url, handler).second);
   }
@@ -678,6 +750,7 @@ class BaseRunner : public td::actor::Actor {
   void store_wallet_stat(SimpleJsonSerializer &jb);
   void store_root_contract_stat(td::StringBuilder &sb);
   void store_root_contract_stat(SimpleJsonSerializer &jb);
+  void store_known_private_keys(td::StringBuilder &sb);
 
   void iterate_check_map(auto &map) {
     auto it = map.begin();
@@ -704,10 +777,12 @@ class BaseRunner : public td::actor::Actor {
   }
 
  private:
+  const RunnerRole role_;
+  bool check_image_hashes_{true};
+
   std::shared_ptr<RunnerConfig> runner_config_;
   td::int32 root_contract_ts_{0};
   td::actor::ActorOwn<TcpClient> client_;
-  td::actor::ActorOwn<ton::http::HttpServer> http_server_;
 
   std::map<TcpClient::ConnectionId, std::unique_ptr<BaseConnection>> all_connections_;
   std::map<TcpClient::TargetId, std::unique_ptr<ProxyTarget>> proxy_targets_;
@@ -750,11 +825,23 @@ class BaseRunner : public td::actor::Actor {
   bool is_test_{false};
   bool is_testnet_{true};
   bool ton_disabled_{false};
-  bool fake_tdx_{false};
+  bool fake_tee_{false};
+  tdx::TeeConfig tdx_tee_config_{};
+  sev::TeeConfig sev_tee_config_{};
+  RATLSInterface::Config ratls_config_{};
   std::string ton_pseudo_config_;
   std::string http_access_hash_;
 
+  td::Timestamp next_key_manager_request_at_;
+  td::IPAddress key_manager_addr_;
+  TcpClient::ListeningSocketId key_manager_socket_id_{0};
+  TcpClient::ConnectionId key_manager_connection_id_{0};
+  std::map<td::Bits256, std::shared_ptr<BaseRunnerPrivateKey>> cocoon_pk_map_;
+  std::unique_ptr<KeyManagerOutboundConnection> key_manager_connection_;
+
   std::map<std::string, HttpHandler> custom_http_handlers_;
+
+  td::actor::Scheduler *scheduler_;
 };
 
 }  // namespace cocoon

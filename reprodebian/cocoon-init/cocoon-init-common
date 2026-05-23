@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Common things for cocoon initialization
+set -euo pipefail
+
+# Configuration
+CERT_DIR="/etc/tee"
+SPEC_RAW_DIR="/mnt/spec"
+SPEC_OUT_DIR="/spec"
+CERT_FILE="$CERT_DIR/cert.pem"
+KEY_HASH_FILE="$CERT_DIR/key.hash"
+PERSISTENT_MOUNT="/data"
+KEYS=("disk_encryption:sealed.key" "app:app.key")
+SEALED_KEY_FILE="$CERT_DIR/sealed.key"
+
+SEV_PKI_ROOT_DIR="${CERT_DIR}/sev"
+
+if grep -Po '\bcocoon_debug\b' /proc/cmdline; then
+  echo "DEBUG MODE: All keys use same debug value"
+  is_debug=true
+  IS_DEBUG_INT=1;
+else
+  is_debug=false
+  IS_DEBUG_INT=0;
+fi
+
+boottime() {
+  awk -F. '{printf $1}' /proc/uptime
+}
+
+init_tdx_pccs() {
+  systemctl stop pccs
+  cd /opt/intel/sgx-dcap-pccs
+  npm ci
+  if [ $? -gt 0 ]
+  then
+    printf "npm ci non zero exit status\n"
+  fi
+  chown pccs .
+  chown pccs config/default.json
+  mkdir -p ssl_key 2>/dev/null || true
+  openssl req -x509 -newkey rsa:2048 -keyout ssl_key/private.pem -out ssl_key/file.crt -days 3650 -nodes -subj "/CN=local-pccs/"
+  chown pccs ssl_key/private.pem ssl_key/file.crt
+  sed -i "/use_secure_cert/s/true/false/" /etc/sgx_default_qcnl.conf
+  systemctl start pccs
+}
+
+sev_kds_download() {
+    local url="$1"
+
+    cutoff_ts=$(($(boottime) + 300))
+    retry_after=10
+
+    while [ "$(boottime)" -lt $cutoff_ts ]; do
+        file=$(mktemp -p "${SEV_PKI_ROOT_DIR}" kds.download.XXXXXXX)
+        hdrs=$(curl -s -v "$url" -o "$file" 2>&1 | grep '^<')
+
+        if [ 0 -eq $? ]; then
+            echo "$file"
+            return
+        fi
+
+        if ! echo "${hdrs}" | head -n 1 | grep -q 'HTTP/1.1 429'; then
+            echo "ERR: AMD KDS rate limited us" >&2
+            exit 1
+        fi
+
+        sleep ${retry_after}
+        retry_after=$((retry_after * 2))
+    done
+}
+
+sev_info_filter_color() {
+  printf "%s" "$1" | sed -e 's/\x1b\[[0-9;]*m//g'
+}
+
+sev_info_extract_url() {
+  sev_info_filter_color "$(printf "%s" "$1" | head -n 1 | awk -F'URL: ' '{printf $2}')"
+}
+
+sev_info_product_name() {
+  sev_info_filter_color "$(sev-info --print-this-cpu-product-name 2>&1 | head -n 1 | awk -F'CPU: ' '{print $2}')"
+}
+
+sev_info_all_product_names() {
+  sev_info_filter_color "$(sev-info --print-all-products 2>&1 | awk -F'ProductName: ' '{print $2}' ORS=' ')"
+}
+
+init_sev_pki() {
+  mkdir -p "${SEV_PKI_ROOT_DIR}"
+  products=$(sev_info_all_product_names)
+
+  for product in ${products}; do
+    if [[ ${product} == "Siena" ]]; then
+      # Refer to "1.5 Determining the Product Name" in "Versioned Chip
+      # Endorsement Key(VCEK) Certificate and KDS Interface Specification"
+      continue
+    fi
+
+    product_cert_chain_url=$(sev_info_extract_url "$(sev-info --print-product-cert-chain-url $product 2>&1)")
+    product_cert_chain_crl_url=$(sev_info_extract_url "$(sev-info --print-product-cert-chain-crl-url $product 2>&1)")
+
+    product_cert_chain_pem="${SEV_PKI_ROOT_DIR}/${product}.cert_chain.pem"
+    product_cert_chain_crl_pem="${SEV_PKI_ROOT_DIR}/${product}.cert_chain_crl.pem"
+
+    cert_chain=$(sev_kds_download "$product_cert_chain_url")
+    cert_chain_crl=$(sev_kds_download "$product_cert_chain_crl_url")
+
+    # KDS gives cert chain in PEM format but cert_chain_crl and
+    # vcek are in DER. Make them PEM.
+    mv "${cert_chain}" "${cert_chain}.pem"
+    openssl crl -in "${cert_chain_crl}" -outform PEM -out "${cert_chain_crl}.pem"
+
+    # And finally atomically update links
+    ln -snf "${cert_chain}.pem" "${product_cert_chain_pem}.next"
+    ln -snf "${cert_chain_crl}.pem" "${product_cert_chain_crl_pem}.next"
+
+    mv -T "${product_cert_chain_pem}.next" ${product_cert_chain_pem}
+    mv -T "${product_cert_chain_crl_pem}.next" ${product_cert_chain_crl_pem}
+  done
+}
+
+init_sev_pki_vcek() {
+  vcek_url=$(sev_info_extract_url "$(sev-info --print-this-cpu-vcek-url 2>&1)")
+  vcek=$(sev_kds_download "$vcek_url")
+  openssl x509 -in "${vcek}" -outform PEM -out "${vcek}.pem"
+  ln -snf "${vcek}.pem" "${SEV_PKI_ROOT_DIR}/vcek.pem.next"
+  mv -T "${SEV_PKI_ROOT_DIR}"/vcek.pem.next "${SEV_PKI_ROOT_DIR}/vcek.pem"
+}
+
+create_secure_directories() {
+  # Create secure directories
+  echo "Creating secure directories..."
+  mkdir -p "$CERT_DIR" "$SPEC_OUT_DIR"
+  chmod 700 "$CERT_DIR"
+}
+
+prepare_spec() {
+  # Prepare spec from raw source
+  if [ ! -d "$SPEC_RAW_DIR" ]; then
+    echo "ERR: Raw spec directory not found: $SPEC_RAW_DIR" >&2
+    exit 1
+  fi
+
+  if ! spec_hash=$(cocoon-prepare-spec "$SPEC_RAW_DIR" "$SPEC_OUT_DIR"); then
+    echo "ERR: Failed to prepare specification" >&2
+    exit 1
+  fi
+
+  printf "%s" $spec_hash;
+}
+
+render_ton_config() {
+  # Render TON config (needed for time synchronization during cert generation)
+  echo "Rendering TON configuration..."
+  cocoon-render-ton-config
+}
+
+generate_tee_certificate() {
+  # Generate certificate and key with TEE attestation
+  # Uses gen-cert-synced to ensure certificate time is synchronized with TON
+  echo "Generating TEE certificate and key with synchronized time..."
+  export cert_base="$CERT_DIR/tee"
+  if ! gen-cert-synced --tee tee --name "$cert_base" --force; then
+    echo "ERR: Failed to generate certificate and key" >&2
+    exit 1
+  fi
+}
+
+generate_system_vars() {
+  # Generate system variables for all components
+  echo "Generating system variables..."
+  mkdir -p /run
+  if [[ ! -f "$cert_base"_image_hash.b64 ]]; then
+      echo "ERR: TEE image hash file not found: $cert_base"_image_hash.b64 >&2
+      exit 1
+  fi
+  
+  export TEE_IMAGE_HASH=$(cat "$cert_base"_image_hash.b64)
+  export APP_KEY=$(base64 < "$CERT_DIR/app.key")
+  {
+      echo "TEE_IMAGE_HASH=$TEE_IMAGE_HASH"
+      echo "TON_CONFIG_FILE=/run/spec/global.config.json"
+      echo "APP_KEY=$APP_KEY"
+      echo "DISK_PATH=/data"
+      echo "IS_DEBUG=$IS_DEBUG_INT"
+  } > /run/system.vars
+  
+  echo "Generated system variables for all components:"
+  echo "  TEE_IMAGE_HASH: $TEE_IMAGE_HASH"
+}
+
+setup_persistent_disk() {
+  if [[ -L /dev/disk/by-id/virtio-persistent ]]; then
+    if cryptsetup isLuks /dev/disk/by-id/virtio-persistent; then
+      if cryptsetup luksOpen /dev/disk/by-id/virtio-persistent persistent --key-file=$SEALED_KEY_FILE; then
+        if mount /dev/mapper/persistent /data; then
+          echo "Disk unsealed successfully."
+        else
+          echo "ERR: Disk unsealed successfully, but the file system failed to mount." >&2
+          exit 1
+        fi
+      else
+        echo "ERR: Disk seal key doesn't match." >&2
+        exit 1
+      fi
+    else
+      if blkid /dev/disk/by-id/virtio-persistent; then
+        echo "ERR: Persistent disk is not a LUKS container." >&2
+        exit 1
+      else
+        echo "Persistent disk is empty. Creating a seal."
+        cryptsetup luksFormat -q /dev/disk/by-id/virtio-persistent --key-file=$SEALED_KEY_FILE </dev/null || {
+          # TODO: pick proper hash parameters
+          echo "ERR: Could not format the disk as a LUKS container." >&2;
+          exit 1
+        }
+        cryptsetup luksOpen -q /dev/disk/by-id/virtio-persistent persistent --key-file=$SEALED_KEY_FILE || {
+          echo "ERR: ?? Could not open the sealed container after formatting." >&2
+          exit 1
+        }
+        mkfs.ext4 /dev/mapper/persistent || {
+          echo "ERR: Could not create a filesystem in the sealed container." >&2
+          exit 1
+        }
+        mount /dev/mapper/persistent "$PERSISTENT_MOUNT" || {
+          echo "ERR: ?? Could not mount a new filesystem." >&2
+          exit 1
+        }
+        mkdir "$PERSISTENT_MOUNT/docker"
+      fi
+    fi
+  else
+    echo "ERR: No virtio device with serial 'persistent'." >&2
+    exit 1
+  fi
+}
+
+fix_permissions() {
+  # Set secure permissions on generated files
+  chmod 400 "$cert_base"_cert.pem "$cert_base"_key.pem 2>/dev/null || true
+  echo "Certificate saved to ${cert_base}_cert.pem"
+  echo "Private key saved to ${cert_base}_key.pem"
+}
+
+print_final_status() {
+  echo "=== Tee Guest Initialization Complete ==="
+  echo ""
+  echo "ATTESTATION INFORMATION:"
+  echo "  Spec hash: $spec_hash"
+  echo "  Key hash:  $key_hash"
+  echo ""
+  echo "SECURITY ARTIFACTS:"
+  echo "  TEE Certificate: ${cert_base}_cert.pem"
+  echo "  TEE Private Key: ${cert_base}_key.pem"
+  echo "  TEE Image Hash: $TEE_IMAGE_HASH"
+  echo "  Disk Encryption Key: $SEALED_KEY_FILE"
+  echo ""
+  echo "PREPARED SPECIFICATION:"
+  echo "  Source: $SPEC_RAW_DIR"
+  echo "  Output: $SPEC_OUT_DIR"
+  echo "  Hash:   $spec_hash"
+  echo ""
+  echo "NEXT STEPS:"
+  echo "  1. Use certificate for TLS/attestation: ${cert_base}_cert.pem"
+  echo "  2. Serve application from: $SPEC_OUT_DIR"
+  echo "  3. Runtime configs available in: $SPEC_OUT_DIR/runtime/"
+  echo "  4. Persistent volume available in: $PERSISTENT_MOUNT/"
+  echo ""
+  echo "TEE guest is ready for production workloads"
+}

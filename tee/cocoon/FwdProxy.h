@@ -1,7 +1,8 @@
 #pragma once
 #include "td/net/TcpListener.h"
 #include "td/utils/SharedValue.h"
-#include "tdx.h"
+#include "tee/cocoon/Tee.h"
+#include "tee/cocoon/RATLS.h"
 #include <map>
 
 namespace cocoon {
@@ -10,9 +11,9 @@ class FwdProxy final : public td::actor::Actor {
  public:
   struct Config {
     int port_{8081};  // port to listen
-    td::SharedValue<tdx::CertAndKey> cert_and_key_;
+    td::SharedValue<TeeCertAndKey> cert_and_key_;
     std::string default_policy_;
-    std::map<std::string, tdx::PolicyRef, std::less<>> policies_;
+    std::map<std::string, RATLSPolicyRef, std::less<>> policies_;
     bool allow_policy_from_username_{false};
     bool skip_socks5{false};
     bool serialize_info{false};
@@ -23,7 +24,7 @@ class FwdProxy final : public td::actor::Actor {
     // For forward proxy (skip_socks5=true)
     td::IPAddress fixed_destination_;
 
-    td::Result<tdx::PolicyRef> find_policy(td::Slice username) const;
+    td::Result<RATLSPolicyRef> find_policy(td::Slice username) const;
   };
   explicit FwdProxy(Config config) : config_(std::make_shared<Config>(std::move(config))) {
   }

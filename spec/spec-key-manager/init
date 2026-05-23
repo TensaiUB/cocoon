@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+set -x
+
+echo "INIT KEY MANAGER RUNNER"
+
+cocoon-render-config key-manager-config.json
+
+cocoon-render-ton-config
+
+systemctl enable /spec/cocoon-router.service
+systemctl enable /spec/cocoon-key-manager-runner.service
+systemctl start cocoon-router.service cocoon-key-manager-runner.service

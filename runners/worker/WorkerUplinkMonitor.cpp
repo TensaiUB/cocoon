@@ -1,53 +1,49 @@
 #include "WorkerUplinkMonitor.h"
 #include "WorkerRunner.h"
-#include "http/http.h"
+#include "boost-http/http.h"
+#include "td/actor/ActorId.h"
 #include "td/actor/actor.h"
+#include "td/actor/common.h"
 #include "td/utils/Time.h"
 #include "runners/helpers/HttpSender.hpp"
 #include "td/utils/buffer.h"
+#include "boost-http/http-client.h"
+#include <memory>
 
 namespace cocoon {
 
 void WorkerUplinkMonitor::send_request() {
-  auto req = ton::http::HttpRequest::create("GET", "/v1/models", "HTTP/1.0").move_as_ok();
-  req->complete_parse_header().ensure();
-  auto payload = req->create_empty_payload().move_as_ok();
-  payload->complete_parse();
+  class Cb : public http::HttpRequestCallback {
+   public:
+    Cb(td::actor::ActorId<WorkerUplinkMonitor> self, td::actor::Scheduler *scheduler)
+        : self_(self), scheduler_(scheduler) {
+    }
 
-  td::actor::send_closure(
-      runner_, &WorkerRunner::send_http_request, std::move(req), std::move(payload), td::Timestamp::in(10.0),
-      [self_id = actor_id(this)](
-          td::Result<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> R) {
-        if (R.is_error()) {
-          td::actor::send_closure(self_id, &WorkerUplinkMonitor::requests_completed, false);
-        } else {
-          td::actor::send_closure(self_id, &WorkerUplinkMonitor::got_http_answer, R.move_as_ok());
-        }
-      });
+    void receive_answer(td::int32 status_code, std::string content_type,
+                        std::vector<std::pair<std::string, std::string>> headers, std::string body_part = "",
+                        bool is_completed = false) override {
+      scheduler_->run_in_context(
+          [&]() { td::actor::send_closure_later(self_, &WorkerUplinkMonitor::got_http_answer, status_code); });
+    }
+    void receive_payload_part(std::string body_part, bool is_completed) override {
+    }
+
+   private:
+    td::actor::ActorId<WorkerUplinkMonitor> self_;
+    td::actor::Scheduler *scheduler_;
+  };
+
+  http::run_http_request(addr_, http::HttpCallback::RequestType::Get, "/v1/models", {}, "", 30.0,
+                         std::make_unique<Cb>(actor_id(this), scheduler_));
 }
 
-void WorkerUplinkMonitor::got_http_answer(
-    std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>> res) {
-  if (res.first->code() != ton::http::HttpStatusCode::status_ok) {
-    requests_completed(false);
-    return;
-  }
-
-  td::actor::create_actor<HttpPayloadReceiver>(
-      "payloadreceiver", std::move(res.second),
-      [self_id = actor_id(this)](td::Result<td::BufferSlice> R) {
-        if (R.is_error()) {
-          td::actor::send_closure(self_id, &WorkerUplinkMonitor::requests_completed, false);
-        } else {
-          td::actor::send_closure(self_id, &WorkerUplinkMonitor::requests_completed, true);
-        }
-      },
-      td::Timestamp::in(30.0))
-      .release();
+void WorkerUplinkMonitor::got_http_answer(td::int32 status_code) {
+  requests_completed(status_code == 200);
 }
 
 void WorkerUplinkMonitor::requests_completed(bool is_success) {
   if (is_success != cur_state_) {
+    LOG(INFO) << "changing uplink state: ready=" << (is_success ? "YES" : "NO");
     cur_state_ = is_success;
     td::actor::send_closure(runner_, &WorkerRunner::set_uplink_is_ok, is_success);
   }

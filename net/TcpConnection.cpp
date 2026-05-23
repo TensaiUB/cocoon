@@ -20,7 +20,8 @@
 #include "TcpConnection.hpp"
 #include "auto/tl/cocoon_api.h"
 #include "auto/tl/cocoon_api.hpp"
-#include "cocoon/tdx.h"
+#include "tee/cocoon/RATLS.h"
+#include "tee/cocoon/Tee.h"
 #include "td/net/Pipe.h"
 #include "td/utils/Status.h"
 #include "td/utils/buffer.h"
@@ -97,10 +98,10 @@ void TcpConnection::socks5_connected(td::BufferedFd<td::SocketFd> fd) {
 
 void TcpConnection::tls_solved_pow(td::SocketPipe pipe) {
   td::connect(
-      [self = actor_id(this)](td::Result<std::pair<td::Pipe, AttestedPeerInfo>> R) {
+      [self = actor_id(this)](td::Result<std::pair<td::Pipe, RATLSAttestedPeerInfo>> R) {
         if (R.is_ok()) {
           auto res = R.move_as_ok();
-          td::actor::send_closure(self, &TcpConnection::tls_created_pipe, std::move(res.first), std::move(res.second.attestation_data));
+          td::actor::send_closure(self, &TcpConnection::tls_created_pipe, std::move(res.first), res.second.report());
         } else {
           td::actor::send_closure(self, &TcpConnection::fail,
                                   R.move_as_error_prefix("tcp: failed to create tls connection: "));
@@ -110,8 +111,8 @@ void TcpConnection::tls_solved_pow(td::SocketPipe pipe) {
                       type_->type.get<TcpConnectionTls>().policy, td::IPAddress{}, td::IPAddress{}));
 }
 
-void TcpConnection::tls_created_pipe(td::Pipe pipe, tdx::AttestationData attestation) {
-  process_attestation(std::move(attestation));
+void TcpConnection::tls_created_pipe(td::Pipe pipe, const RATLSAttestationReport &report) {
+  process_attestation(report);
 
   simple_pipe_ = std::move(pipe);
   start();
@@ -143,6 +144,7 @@ void TcpConnection::send(td::BufferSlice data) {
   auto data_size = td::narrow_cast<td::uint32>(data.size());
   if (data_size < 4 || data_size > (1 << 24)) {
     LOG(WARNING) << "tcp: bad packet size " << data_size;
+    fail(td::Status::Error(ton::ErrorCode::protoviolation, "invalid packet length"));
     return;
   }
 
@@ -244,11 +246,11 @@ void TcpConnection::loop() {
     auto &input = *input_ptr;
     bool exit_loop = false;
     if (!received_attestation_) {
-      TRY_RESULT(attestation_opt, cocoon::framed_tl_read<AttestedPeerInfo>(input));
-      if (!attestation_opt) {
+      TRY_RESULT(attested_peer_info, cocoon::framed_tl_read<RATLSAttestedPeerInfo>(input));
+      if (!attested_peer_info) {
         exit_loop = true;
       } else {
-        process_attestation(attestation_opt.value().attestation_data);
+        process_attestation((*attested_peer_info).report());
       }
     }
     while (!exit_loop) {

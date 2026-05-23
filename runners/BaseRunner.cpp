@@ -3,16 +3,19 @@
 #include "auto/tl/tonlib_api.h"
 #include "auto/tl/tonlib_api.hpp"
 #include "block.h"
-#include "cocoon/tdx.h"
+#include "tee/cocoon/RATLS.h"
+#include "tee/cocoon/Tee.h"
 #include "common/bitstring.h"
-#include "http/http.h"
+#include "boost-http/http.h"
 #include "net/TcpClient.h"
 #include "td/actor/ActorId.h"
 #include "td/actor/ActorOwn.h"
 #include "td/actor/MultiPromise.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/actor/actor.h"
+#include "td/actor/common.h"
 #include "td/utils/Random.h"
+#include "td/utils/SharedSlice.h"
 #include "td/utils/Status.h"
 #include "td/utils/Time.h"
 #include "td/utils/UInt.h"
@@ -53,6 +56,20 @@
 
 namespace cocoon {
 
+const std::string &get_from_sorted_list(const std::vector<std::pair<std::string, std::string>> &vec,
+                                        const std::string &name) {
+  auto it = std::lower_bound(
+      vec.begin(), vec.end(), name,
+      [](const std::pair<std::string, td::string> &l, const std::string &name) { return l.first < name; });
+
+  if (it == vec.end() || it->first != name) {
+    static const std::string empty = "";
+    return empty;
+  } else {
+    return it->second;
+  }
+}
+
 /* 
  *
  * REMOTE APP TYPE
@@ -74,6 +91,12 @@ RemoteAppType remote_app_type_unknown() {
 RemoteAppType remote_app_type_worker() {
   RemoteAppType t;
   t.info = "worker";
+  return t;
+}
+
+RemoteAppType remote_app_type_key_manager() {
+  RemoteAppType t;
+  t.info = "keymanager";
   return t;
 }
 
@@ -196,6 +219,41 @@ bool ProxyTarget::should_choose_another_proxy() {
  *
  */
 
+td::Status BaseRunner::check_verification_key(const RemoteAppType &app_type, const td::Bits256 &verified_by) {
+  if (!check_image_is_verified()) {
+    return td::Status::OK();
+  }
+
+  if (!runner_config_ || !runner_config_->root_contract_config) {
+    return td::Status::Error(ton::ErrorCode::notready, "didn't download root contract state");
+  }
+
+  auto &conf = *runner_config_->root_contract_config;
+  if (app_type == remote_app_type_proxy()) {
+    if (!conf.has_proxy_verified_key(verified_by)) {
+      return td::Status::Error(ton::ErrorCode::protoviolation,
+                               PSTRING() << "proxy verified by unknown key " << verified_by.to_hex());
+    }
+    return td::Status::OK();
+  }
+  if (app_type == remote_app_type_worker()) {
+    if (!conf.has_worker_verified_key(verified_by)) {
+      return td::Status::Error(ton::ErrorCode::protoviolation,
+                               PSTRING() << "worker verified by unknown key " << verified_by.to_hex());
+    }
+    return td::Status::OK();
+  }
+  if (app_type == remote_app_type_key_manager()) {
+    if (!conf.has_key_manager_verified_key(verified_by)) {
+      return td::Status::Error(ton::ErrorCode::protoviolation,
+                               PSTRING() << "key manager verified by unknown key " << verified_by.to_hex());
+    }
+    return td::Status::OK();
+  }
+
+  return td::Status::OK();
+}
+
 /*
  *
  * SETTERS
@@ -261,23 +319,29 @@ void BaseRunner::load_config_completed() {
 }
 void BaseRunner::initialize_http_server(td::Promise<td::Unit> promise) {
   if (http_port_ > 0) {
-    class Cb : public ton::http::HttpServer::Callback {
+    class Cb : public http::HttpCallback {
      public:
-      Cb(td::actor::ActorId<BaseRunner> client) : client_(std::move(client)) {
+      Cb(td::actor::ActorId<BaseRunner> client, td::actor::Scheduler *scheduler)
+          : client_(std::move(client)), scheduler_(scheduler) {
       }
-
-      void receive_request(
-          std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) override {
-        td::actor::send_closure(client_, &BaseRunner::receive_http_request_outer, std::move(request),
-                                std::move(payload), std::move(promise));
+      void receive_request(http::HttpCallback::RequestType request_type,
+                           std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                           std::vector<std::pair<std::string, std::string>> args, std::string body,
+                           std::unique_ptr<http::HttpRequestCallback> answer_callback) override {
+        CHECK(answer_callback);
+        scheduler_->run_in_context([&]() {
+          td::actor::send_closure_later(client_, &BaseRunner::receive_http_request_outer, request_type,
+                                        std::move(headers), std::move(path), std::move(args), std::move(body),
+                                        std::move(answer_callback));
+        });
       }
 
      private:
       td::actor::ActorId<BaseRunner> client_;
+      td::actor::Scheduler *scheduler_;
     };
-    http_server_ = ton::http::HttpServer::create(http_port_, std::make_unique<Cb>(actor_id(this)));
+
+    http::init_http_server(http_port_, std::make_shared<Cb>(actor_id(this), scheduler_));
   }
   promise.set_value(td::Unit());
 }
@@ -301,14 +365,33 @@ void BaseRunner::initialize_rpc_server(td::Promise<td::Unit> promise) {
     LOG(INFO) << "using proxy " << connection_to_proxy_via_;
     td::actor::send_closure(client_, &TcpClient::add_connection_to_remote_app_type_rule, remote_app_type_proxy(),
                             std::make_shared<TcpConnectionType>(TcpConnectionSocks5(connection_to_proxy_via_)));
+    td::actor::send_closure(client_, &TcpClient::add_connection_to_remote_app_type_rule, remote_app_type_key_manager(),
+                            std::make_shared<TcpConnectionType>(TcpConnectionSocks5(connection_to_proxy_via_)));
   } else {
-    LOG(INFO) << "using " << (fake_tdx_ ? "fake" : "real") << " tdx-tls connection";
-    auto cert_and_key = tdx::generate_cert_and_key(nullptr);
-    auto tdx_interface = fake_tdx_ ? tdx::TdxInterface::create_fake() : tdx::TdxInterface::create();
-    tdx::PolicyConfig conf{};  // allow all
-    auto policy = tdx::Policy::make(tdx_interface, conf);
-    td::actor::send_closure(client_, &TcpClient::add_connection_to_remote_app_type_rule, remote_app_type_proxy(),
-                            std::make_shared<TcpConnectionType>(TcpConnectionTls(cert_and_key, policy)));
+    LOG(INFO) << "using " << (fake_tee_ ? "fake" : "real") << " tdx-tls connection";
+
+    auto make_tee = [&](bool fake) -> td::Result<TeeInterfaceRef> {
+      TRY_RESULT(tee_type, TeeInterface::this_cpu_tee_type());
+
+      switch (tee_type) {
+        case TeeType::Sev:
+          return sev::make_tee(fake, sev_tee_config_);
+        case TeeType::Tdx:
+          return tdx::make_tee(fake, tdx_tee_config_);
+      }
+
+      UNREACHABLE();
+    };
+    TRY_RESULT_PROMISE(promise, tee_interface, make_tee(fake_tee_));
+    TRY_RESULT_PROMISE(promise, cert_and_key, generate_cert_and_key(tee_interface.get()));
+    TRY_RESULT_PROMISE(promise, ratls_interface, RATLSInterface::make(scheduler_, fake_tee_, ratls_config_));
+
+    td::actor::send_closure(
+        client_, &TcpClient::add_connection_to_remote_app_type_rule, remote_app_type_proxy(),
+        std::make_shared<TcpConnectionType>(TcpConnectionTls(cert_and_key, RATLSPolicy::make(ratls_interface))));
+    td::actor::send_closure(
+        client_, &TcpClient::add_connection_to_remote_app_type_rule, remote_app_type_key_manager(),
+        std::make_shared<TcpConnectionType>(TcpConnectionTls(cert_and_key, RATLSPolicy::make(ratls_interface))));
   }
   promise.set_value(td::Unit());
 }
@@ -487,8 +570,10 @@ void BaseRunner::cond_reconnect_to_proxy() {
 
 void BaseRunner::inbound_connection_ready(TcpClient::ConnectionId connection_id,
                                           TcpClient::ListeningSocketId listening_socket_id,
-                                          const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) {
-  auto conn = allocate_inbound_connection(connection_id, listening_socket_id, remote_app_type, remote_app_hash);
+                                          const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                                          const td::Bits256 &verified_by) {
+  auto conn =
+      allocate_inbound_connection(connection_id, listening_socket_id, remote_app_type, remote_app_hash, verified_by);
   if (!conn) {
     close_connection(connection_id);
     return;
@@ -499,15 +584,55 @@ void BaseRunner::inbound_connection_ready(TcpClient::ConnectionId connection_id,
 }
 
 void BaseRunner::outbound_connection_ready(TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id,
-                                           const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) {
+                                           const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                                           const td::Bits256 &verified_by) {
   LOG(INFO) << "outbound connection ready: connection_id=" << connection_id << " target_id=" << target_id;
+
+  if (remote_app_type == remote_app_type_key_manager()) {
+    if (check_image_hashes()) {
+      if (!runner_config_ || !runner_config_->root_contract_config) {
+        fail_connection(connection_id, td::Status::Error("cannot verify key manager connection"));
+        return;
+      }
+      if (runner_config_->root_contract_config->key_manager_image_hash() != remote_app_hash) {
+        fail_connection(connection_id, td::Status::Error("wrong key manager image hash"));
+        return;
+      }
+    }
+    {
+      auto S = check_verification_key(remote_app_type, verified_by);
+      if (S.is_error()) {
+        return fail_connection(connection_id, std::move(S));
+      }
+    }
+
+    if (target_id != key_manager_socket_id_) {
+      fail_connection(connection_id, td::Status::Error("wrong key manager target id"));
+      return;
+    }
+
+    if (key_manager_connection_id_ > 0) {
+      fail_connection(key_manager_connection_id_, td::Status::Error("created newer connection"));
+    }
+
+    key_manager_connection_id_ = connection_id;
+    auto conn = std::make_unique<KeyManagerOutboundConnection>(this, remote_app_type, remote_app_hash, verified_by,
+                                                               connection_id, role_);
+
+    auto it2 = all_connections_.emplace(connection_id, std::move(conn)).first;
+    LOG(DEBUG) << "sending connected to created outbound connection";
+    it2->second->start_up();
+    return;
+  }
+
   auto it = proxy_targets_.find(target_id);
   if (it == proxy_targets_.end()) {
     LOG(INFO) << "failing created outbound connection: unknown proxy target " << target_id;
     close_connection(connection_id);
     return;
   }
-  auto proxy_conn = allocate_proxy_outbound_connection(connection_id, target_id, remote_app_type, remote_app_hash);
+  auto proxy_conn =
+      allocate_proxy_outbound_connection(connection_id, target_id, remote_app_type, remote_app_hash, verified_by);
   if (!proxy_conn) {
     LOG(INFO) << "failing created outbound connection: rejected by application";
     close_connection(connection_id);
@@ -534,14 +659,16 @@ std::unique_ptr<TcpClient::Callback> BaseRunner::make_tcp_client_callback() {
     Cb(td::actor::ActorId<BaseRunner> runner) : runner_(runner) {
     }
     void on_ready_outbound(TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id,
-                           const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) override {
+                           const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                           const td::Bits256 &verified_by) override {
       td::actor::send_closure(runner_, &BaseRunner::outbound_connection_ready, connection_id, target_id,
-                              remote_app_type, remote_app_hash);
+                              remote_app_type, remote_app_hash, verified_by);
     }
     void on_ready_inbound(TcpClient::ConnectionId connection_id, TcpClient::ListeningSocketId listening_socket_id,
-                          const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) override {
+                          const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
+                          const td::Bits256 &verified_by) override {
       td::actor::send_closure(runner_, &BaseRunner::inbound_connection_ready, connection_id, listening_socket_id,
-                              remote_app_type, remote_app_hash);
+                              remote_app_type, remote_app_hash, verified_by);
     }
     void on_stop_ready(TcpClient::ConnectionId connection_id) override {
       td::actor::send_closure(runner_, &BaseRunner::conn_stop_ready, connection_id);
@@ -566,50 +693,37 @@ std::unique_ptr<TcpClient::Callback> BaseRunner::make_tcp_client_callback() {
  * HANDLERS
  *
  */
-void BaseRunner::receive_http_request_outer(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  auto R = http_parse_url(request->url());
-  if (R.is_error()) {
-    ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
-    return;
-  }
-
-  auto info = R.move_as_ok();
-
-  if (info.url == "/perf") {
-    connect(std::move(promise), generate_perf_stats(std::move(info)));
+void BaseRunner::receive_http_request_outer(http::HttpCallback::RequestType request_type,
+                                            std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                            std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                            std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+  if (path == "/perf") {
+    generate_perf_stats(std::move(answer_callback)).detach();
     return;
   }
 
   {
-    auto R = http_parse_url(request->url());
-    if (R.is_ok()) {
-      auto res = R.move_as_ok();
-      auto it = custom_http_handlers_.find(res.url);
-      if (it != custom_http_handlers_.end()) {
-        if (http_access_hash_.size() > 0 && res.get_args["access_hash"] != http_access_hash_) {
-          ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
-          return;
-        }
-        it->second(res.url, res.get_args, std::move(request), std::move(payload), std::move(promise));
+    auto it = custom_http_handlers_.find(path);
+    if (it != custom_http_handlers_.end()) {
+      if (http_access_hash_.size() > 0 && get_from_sorted_list(args, "access_hash") != http_access_hash_) {
+        http_send_static_answer(403 /*access denied */, "", std::move(answer_callback));
         return;
       }
+      it->second(request_type, std::move(headers), std::move(path), std::move(args), std::move(body),
+                 std::move(answer_callback));
+      return;
     }
   }
 
-  receive_http_request(std::move(request), std::move(payload), std::move(promise));
+  receive_http_request(request_type, std::move(headers), std::move(path), std::move(args), std::move(body),
+                       std::move(answer_callback));
 }
 
-void BaseRunner::receive_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  if (payload->payload_type() != ton::http::HttpPayload::PayloadType::pt_empty) {
-    ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
-    return;
-  }
-  std::string data = "<http><body>OK</body></http>";
-  http_send_static_answer(std::move(data), std::move(promise));
+void BaseRunner::receive_http_request(http::HttpCallback::RequestType request_type,
+                                      std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                      std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                      std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+  http_send_static_answer(404, "not found", std::move(answer_callback));
 }
 
 /*
@@ -644,9 +758,21 @@ void BaseRunner::alarm() {
     next_root_contract_state_update_at_ = td::Timestamp::in(td::Random::fast(30.0, 60.0));
     update_root_contract_state().start().detach("update_root_contract_state");
   }
+  gc_cocoon_pk();
+  if (is_initialized() && next_key_manager_request_at_.is_in_past()) {
+    if (role_ == RunnerRole::Proxy || role_ == RunnerRole::Worker) {
+      get_private_keys_from_key_manager();
+    }
+    if (role_ == RunnerRole::Proxy) {
+      next_key_manager_request_at_ = td::Timestamp::in(td::Random::fast(5.0, 10.0));
+    } else {
+      next_key_manager_request_at_ = td::Timestamp::in(td::Random::fast(60.0, 120.0));
+    }
+  }
   alarm_timestamp() = td::Timestamp::in(td::Random::fast(1.0, 2.0));
   alarm_timestamp().relax(next_monitor_at_);
   alarm_timestamp().relax(next_root_contract_state_update_at_);
+  alarm_timestamp().relax(next_key_manager_request_at_);
   if (delayed_action_queue_.size() > 0) {
     alarm_timestamp().relax(delayed_action_queue_.top()->at());
   }
@@ -687,103 +813,136 @@ td::actor::Task<td::Unit> BaseRunner::update_root_contract_state() {
   co_return td::Unit();
 }
 
+void BaseRunner::get_private_keys_from_key_manager() {
+  if (!is_initialized()) {
+    return;
+  }
+
+  if (role_ != RunnerRole::Worker && role_ != RunnerRole::Proxy) {
+    return;
+  }
+
+  auto conf = runner_config_;
+  if (!conf || !conf->root_contract_config) {
+    return;
+  }
+
+  auto fail = [&]() {
+    if (key_manager_socket_id_ > 0) {
+      td::actor::send_closure(client_, &TcpClient::del_outbound_address, key_manager_socket_id_);
+      key_manager_socket_id_ = 0;
+      key_manager_addr_ = td::IPAddress();
+      if (key_manager_connection_id_ > 0) {
+        fail_connection(key_manager_connection_id_, td::Status::Error("closing key manager"));
+        key_manager_connection_id_ = 0;
+      }
+    }
+  };
+
+  auto key_manager_addr = conf->root_contract_config->key_manager_address();
+  if (!key_manager_addr.is_valid()) {
+    return fail();
+  }
+  if (key_manager_addr != key_manager_addr_) {
+    fail();
+    key_manager_addr_ = key_manager_addr;
+    key_manager_socket_id_ = generate_unique_uint64();
+
+    td::actor::send_closure(client_, &TcpClient::add_outbound_address, key_manager_socket_id_, key_manager_addr,
+                            remote_app_type_key_manager());
+  }
+
+  if (key_manager_connection_id_ > 0) {
+    td::BufferSlice req;
+    if (role_ == RunnerRole::Proxy) {
+      req = cocoon::create_serialize_tl_object<cocoon_api::keyManager_getProxyPrivateKeys>(0);
+    } else if (role_ == RunnerRole::Worker) {
+      req = cocoon::create_serialize_tl_object<cocoon_api::keyManager_getWorkerPrivateKeys>(0);
+    } else {
+      return;
+    }
+
+    send_query_to_connection(key_manager_connection_id_, "get_private_keys", std::move(req), td::Timestamp::in(60.0),
+                             [runner = this](td::Result<td::BufferSlice> R) mutable {
+                               if (R.is_ok()) {
+                                 runner->got_private_keys_from_key_manager(R.move_as_ok());
+                               }
+                             });
+  }
+}
+
+void BaseRunner::got_private_keys_from_key_manager(td::BufferSlice R) {
+  auto R2 = cocoon::fetch_tl_object<cocoon_api::keyManager_privateKeys>(std::move(R), true);
+  if (R2.is_error()) {
+    LOG(WARNING) << "failed to parse answer from key manager: " << R2.move_as_error();
+  } else {
+    auto res = R2.move_as_ok();
+    for (auto &k : res->keys_) {
+      td::Ed25519::PrivateKey pk(td::SecureString(k->private_key_.as_slice()));
+      td::Bits256 pub;
+      pub.as_slice().copy_from(pk.get_public_key().move_as_ok().as_octet_string().as_slice());
+
+      if (cocoon_pk_map_.count(pub) == 0) {
+        auto P = std::make_unique<BaseRunnerPrivateKey>();
+        P->private_key = k->private_key_;
+        P->public_key = pub;
+        P->expire_at = k->valid_until_utime_;
+        cocoon_pk_map_.emplace(pub, std::move(P));
+      }
+    }
+  }
+}
+
 /*
  *
  * HTTP
  *
  */
-td::actor::Task<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-BaseRunner::generate_perf_stats(HttpUrlInfo info) {
+td::actor::Task<td::Unit> BaseRunner::generate_perf_stats(std::unique_ptr<http::HttpRequestCallback> answer_callback) {
   auto actor_stats = co_await td::actor::ask(actor_stats_, &td::actor::ActorStats::prepare_stats);
-  co_return http_gen_static_answer(td::BufferSlice(actor_stats), "text/plain; charset=utf-8");
+  http_send_static_answer(td::BufferSlice(actor_stats), std::move(answer_callback), "text/plain; charset=utf-8");
+  co_return td::Unit();
+}
+void BaseRunner::http_send_static_answer(td::int32 code, std::string text,
+                                         std::unique_ptr<http::HttpRequestCallback> answer_callback,
+                                         std::string content_type) {
+  CHECK(answer_callback);
+  static const std::vector<std::pair<std::string, std::string>> headers{
+      {"Access-Control-Allow-Origin", "*"},
+      {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+      {"Access-Control-Allow-Headers", "Content-Type, Authorization"}};
+  answer_callback->receive_answer(code, content_type, headers, std::move(text), true);
 }
 
-void BaseRunner::http_send_static_answer(
-    td::Result<td::BufferSlice> R,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise,
-    std::string content_type) {
-  promise.set_result(http_gen_static_answer(std::move(R), std::move(content_type)));
-}
-
-td::Result<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-BaseRunner::http_gen_static_answer(td::Result<td::BufferSlice> R, std::string content_type) {
-  ton::http::HttpStatusCode status_code = ton::http::HttpStatusCode::status_ok;
-  std::string status = "ok";
-  td::BufferSlice data;
-
-  if (R.is_error()) {
+void BaseRunner::http_send_static_answer(td::Result<td::BufferSlice> R,
+                                         std::unique_ptr<http::HttpRequestCallback> answer_callback,
+                                         std::string content_type) {
+  if (R.is_ok()) {
+    http_send_static_answer(200, R.move_as_ok().as_slice().str(), std::move(answer_callback), std::move(content_type));
+  } else {
     auto code = R.error().code();
+    td::int32 status_code;
     switch (code) {
       case ton::ErrorCode::cancelled:
       case ton::ErrorCode::notready:
-        status_code = ton::http::HttpStatusCode::status_bad_gateway;
-        status = "bad gateway";
+        status_code = 502 /* bad gateway */;
         break;
       case ton::ErrorCode::timeout:
-        status_code = ton::http::HttpStatusCode::status_gateway_timeout;
-        status = "gateway timeout";
+        status_code = 504 /* gateway timeout */;
         break;
       case ton::ErrorCode::error:
       case ton::ErrorCode::protoviolation:
       case ton::ErrorCode::warning:
-        status_code = ton::http::HttpStatusCode::status_bad_request;
-        status = "bad request";
+        status_code = 400 /* bad request */;
         break;
       case ton::ErrorCode::failure:
       default:
-        status_code = ton::http::HttpStatusCode::status_internal_server_error;
-        status = "internal server error";
+        status_code = 500 /* internal error */;
         break;
     }
-    data = td::BufferSlice(td::Slice(PSTRING() << "received error: " << R.move_as_error() << "\n"));
-  } else {
-    data = R.move_as_ok();
+    http_send_static_answer(status_code, PSTRING() << "Technical data: " << R.move_as_error(),
+                            std::move(answer_callback), std::move(content_type));
   }
-
-  auto response = ton::http::HttpResponse::create("HTTP/1.0", status_code, status, false, false).move_as_ok();
-
-  response->add_header(ton::http::HttpHeader{"Access-Control-Allow-Origin", "*"});
-  response->add_header(ton::http::HttpHeader{"Access-Control-Allow-Methods", "GET, POST, OPTIONS"});
-  response->add_header(ton::http::HttpHeader{"Access-Control-Allow-Headers", "Content-Type, Authorization"});
-  response->add_header(ton::http::HttpHeader{"Content-Type", content_type});
-  response->add_header(ton::http::HttpHeader{"Content-Length", PSTRING() << data.size()});
-  response->complete_parse_header();
-
-  auto P = response->create_empty_payload().move_as_ok();
-  P->add_chunk(std::move(data));
-  P->complete_parse();
-  return std::make_pair(std::move(response), std::move(P));
-}
-
-td::Result<BaseRunner::HttpUrlInfo> BaseRunner::http_parse_url(std::string url) {
-  BaseRunner::HttpUrlInfo res;
-  td::Slice S = url;
-  auto p = S.find('?');
-  if (p == td::Slice::npos) {
-    res.url = url;
-    return res;
-  }
-  res.url = url.substr(0, p);
-  S.remove_prefix(p + 1);
-  while (S.size() > 0) {
-    auto x = S.find('&');
-    td::Slice a;
-    if (x == td::Slice::npos) {
-      a = S;
-      S = td::Slice();
-    } else {
-      a = S.copy().truncate(x);
-      S.remove_prefix(x + 1);
-    }
-
-    x = a.find('=');
-    if (x == td::Slice::npos) {
-      res.get_args.emplace(a.str(), "");
-    } else {
-      res.get_args.emplace(a.copy().truncate(x).str(), a.copy().remove_prefix(x + 1).str());
-    }
-  }
-  return res;
 }
 
 /*
@@ -1098,6 +1257,15 @@ void BaseRunner::store_root_contract_stat(SimpleJsonSerializer &jb) {
   if (conf) {
     conf->root_contract_config->store_stat(this, jb);
   }
+}
+
+void BaseRunner::store_known_private_keys(td::StringBuilder &sb) {
+  sb << "<h1>KNOWN PRIVATE KEYS</h1>\n";
+  sb << "<table>\n";
+  for (auto &k : cocoon_pk_map_) {
+    sb << "<tr><td>" << k.first.to_hex() << "</td><td>" << k.second->expire_at << "</td></tr>\n";
+  }
+  sb << "</table>\n";
 }
 
 }  // namespace cocoon

@@ -1,0 +1,11 @@
+[Unit]
+Description=Update SEV PKI trust chains and its CRL
+After=cocoon-ready.target
+
+[Timer]
+OnActiveSec=7d
+OnUnitInactiveSec=7d
+RandomizedDelaySec=24h
+
+[Install]
+WantedBy=cocoon-ready.target

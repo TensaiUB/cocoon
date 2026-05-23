@@ -19,8 +19,9 @@ class ProxyInboundClientConnection : public ProxyInboundConnection {
  public:
   enum class State { None, Ok, Auth, Failed };
   ProxyInboundClientConnection(BaseRunner *runner, const RemoteAppType &remote_app_type,
-                               const td::Bits256 &remote_app_hash, TcpClient::ConnectionId connection_id)
-      : ProxyInboundConnection(runner, remote_app_type, remote_app_hash, connection_id) {
+                               const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by,
+                               TcpClient::ConnectionId connection_id)
+      : ProxyInboundConnection(runner, remote_app_type, remote_app_hash, verified_by, connection_id) {
   }
 
   ConnectionType connection_type() const override {

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# TEE based on AMD SEV SNP  initialization script
+# First script to run on AMD SEV SNP guest startup
+set -euo pipefail
+
+RPATH=$(dirname "${BASH_SOURCE[0]}")
+
+. "${RPATH}"/cocoon-init-common
+
+do_verification() {
+  nonce=$(printf "%s" "$(openssl rand -hex 64)")
+  report="${SEV_PKI_ROOT_DIR}/report"
+  product_name=$(sev_info_product_name)
+  product_cert_prefix="${SEV_PKI_ROOT_DIR}/$product_name"
+  product_cert_chain="${SEV_PKI_ROOT_DIR}/${product_name}.cert_chain.pem"
+  product_cert_chain_crl="${SEV_PKI_ROOT_DIR}/${product_name}.cert_chain_crl.pem"
+  vcek="${SEV_PKI_ROOT_DIR}/vcek.pem"
+
+  sev-info --save-report "${nonce}":"${report}"
+  openssl verify -CAfile ${product_cert_chain} -CRLfile ${product_cert_chain_crl} ${vcek}
+  sev-info --product-trust-chain "$product_name":${product_cert_prefix} --verify-vcek-certificate $vcek
+  sev-info --product-trust-chain "$product_name":${product_cert_prefix} --vcek-certificate $vcek --verify-report ${nonce}:${report}
+}
+
+make_seal_keys() {
+  echo "Generating sealed keys..."
+  for key_spec in "${KEYS[@]}"; do
+    key_name="${key_spec%%:*}"
+    key_file="$CERT_DIR/${key_spec##*:}"
+
+    if [[ "$is_debug" = true ]]; then
+      echo -n "cococooncococooncococooncococoon" > "$key_file"
+      [[ "$key_name" = "disk_encryption" ]] && key_hash="330b40587dfe15b2a0701c5b9141b108b71474b8b3d4f719f916d944c622b91c"
+    else
+      key_hash=$(sev-info --print-derived-key "$key_file:$key_name") || {
+        echo "ERR: Failed to generate sealed key: $key_name" >&2
+        exit 1
+      }
+    fi
+
+    chmod 400 "$key_file"
+    echo "  $key_name -> $key_file"
+  done
+
+  # Save disk encryption key hash
+  echo "$key_hash" > "$KEY_HASH_FILE"
+  chmod 400 "$KEY_HASH_FILE"
+}
+
+init_tdx_pccs
+init_sev_pki
+init_sev_pki_vcek
+do_verification
+create_secure_directories
+
+echo "Preparing specification..."
+spec_hash=$(prepare_spec)
+echo "Specification prepared successfully"
+echo "Spec hash: $spec_hash"
+
+make_seal_keys
+render_ton_config
+generate_tee_certificate
+generate_system_vars
+setup_persistent_disk
+fix_permissions
+print_final_status
+
+echo "=== SEV Status ==="
+echo ""

@@ -42,7 +42,7 @@ TDX Guest (Worker)          Host                SGX Enclave
 
 ## Protocol Specification
 
-Implementation: [`tee/sgx-enclave/seal-client.cpp`](../tee/sgx-enclave/seal-client.cpp), [`seal-server.cpp`](../tee/sgx-enclave/seal-server.cpp), [`Enclave.cpp`](../tee/sgx-enclave/Enclave.cpp).
+Implementation: [`tee/cocoon/tdx/sgx-enclave/seal-client.cpp`](../tee/cocoon/tdx/sgx-enclave/seal-client.cpp), [`seal-server.cpp`](../tee/cocoon/tdx/sgx-enclave/seal-server.cpp), [`Enclave.cpp`](../tee/cocoon/tdx/sgx-enclave/Enclave.cpp).
 
 ### Transport
 
@@ -77,7 +77,7 @@ persistentKey#163a179a sgx_quote:bytes encrypted_secret:bytes = PersistentKey;
 
 ### Step 1: TDX Guest Generates Request
 
-Implementation in [`seal-client.cpp`](../tee/sgx-enclave/seal-client.cpp) - class `GetPersistentKeyClient`.
+Implementation in [`seal-client.cpp`](../tee/cocoon/tdx/sgx-enclave/seal-client.cpp) - class `GetPersistentKeyClient`.
 
 1. Generate ephemeral EC P-256 keypair
 2. Calculate reportdata = `SHA256(public_key) || 32 zero bytes` (64 bytes total)
@@ -89,7 +89,7 @@ Implementation in [`seal-client.cpp`](../tee/sgx-enclave/seal-client.cpp) - clas
 
 ### Step 2: Host Forwards to SGX Enclave
 
-Implementation in [`seal-server.cpp`](../tee/sgx-enclave/seal-server.cpp) - class `GetPersistentKeyServer`.
+Implementation in [`seal-server.cpp`](../tee/cocoon/tdx/sgx-enclave/seal-server.cpp) - class `GetPersistentKeyServer`.
 
 1. Receive and deserialize request from VSOCK
 2. Call SGX enclave via ECALL: `ecall_gen_key(target_info, tdx_report, public_key, key_name, ...)`
@@ -102,7 +102,7 @@ Implementation in [`seal-server.cpp`](../tee/sgx-enclave/seal-server.cpp) - clas
 
 ### Step 3: SGX Enclave Generates Key
 
-Implementation in [`Enclave.cpp`](../tee/sgx-enclave/Enclave.cpp) - function `ecall_gen_key`.
+Implementation in [`Enclave.cpp`](../tee/cocoon/tdx/sgx-enclave/Enclave.cpp) - function `ecall_gen_key`.
 
 #### 3.1. Validate TDX Report
 
@@ -150,7 +150,7 @@ Create SGX report with reportdata binding this exchange:
 
 ### Step 4: TDX Guest Verifies and Decrypts
 
-Implementation in [`seal-client.cpp`](../tee/sgx-enclave/seal-client.cpp) - class `GetPersistentKeyClient`.
+Implementation in [`seal-client.cpp`](../tee/cocoon/tdx/sgx-enclave/seal-client.cpp) - class `GetPersistentKeyClient`.
 
 #### 4.1. Verify SGX Quote
 
@@ -241,7 +241,7 @@ Three components work together:
 2. **seal-server** (Host) - Forwards requests: `seal-server`
 3. **seal-enclave** (SGX) - Generates keys: `seal-enclave.signed.so`
 
-Implementations in [`tee/sgx-enclave/`](../tee/sgx-enclave/).
+Implementations in [`tee/cocoon/tdx/sgx-enclave/`](../tee/cocoon/tdx/sgx-enclave/).
 
 ### Setup
 

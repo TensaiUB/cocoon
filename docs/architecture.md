@@ -20,7 +20,7 @@ COCOON consists of three parts: client, proxy, and worker. The client pays for r
 **Role:** Executes AI inference requests inside TEE-protected VMs.
 
 - Runs AI models (e.g., LLMs via vllm) inside confidential virtual machines
-- Protected by TEE (currently Intel TDX)
+- Protected by TEE (currently Intel TDX, AMD SEV-SNP)
 - Ensures all requests are kept private and the correct model is used
 - Receives payment from proxies for completed work
 - Minimal setup required: install image, provide config (model name, TON config, wallet address)
@@ -29,7 +29,7 @@ COCOON consists of three parts: client, proxy, and worker. The client pays for r
 
 **Role:** Routes requests from clients to workers
 
-- Protected by TEE (currently Intel TDX)
+- Protected by TEE (currently Intel TDX, AMD SEV-SNP)
 - Selects appropriate workers based on model type, load and reputation
 - Accepts payment from clients
 - Pays workers for completed requests

@@ -40,7 +40,6 @@ namespace cocoon {
 const std::vector<std::string> ALLOWED_SERVICES = {"cocoon-router.service",
                                                    "cocoon-proxy-runner.service",
                                                    "cocoon-worker-runner.service",
-                                                   "cocoon-cert-refresh.service",
                                                    "cocoon-vllm.service",
                                                    "cocoon-health.service",
                                                    "cocoon-ready.target",
@@ -50,12 +49,14 @@ const std::vector<std::string> ALLOWED_SERVICES = {"cocoon-router.service",
                                                    "cocoon-sglang.service",
                                                    "cocoon-cert-refresh.service",
                                                    "cocoon-cert-refresh.timer",
+                                                   "cocoon-sev-pki-update.service",
+                                                   "cocoon-sev-pki-update.timer",
                                                    "spec.service"};
 
 const std::vector<std::string> CRITICAL_BASELINE_SERVICES = {"cocoon-ready.target", "cocoon-health.service"};
 const std::vector<std::string> NON_CRITICAL_BASELINE_SERVICES = {
     "docker.service", "ssh.service", "nvidia-tdx.service", "cocoon-cert-refresh.service", "cocoon-cert-refresh.timer",
-    "spec.service"};
+    "cocoon-sev-pki-update.service", "cocoon-sev-pki-update.timer", "spec.service"};
 
 std::vector<std::string> MONITORED_SERVICES;
 
@@ -257,6 +258,10 @@ td::Result<std::string> gpu(std::istringstream&, const StatsCollector&) {
   return render_gpu::get_metrics();
 }
 
+td::Result<std::string> sev_cmd(std::istringstream&, const StatsCollector&) {
+  return render_sev::get_status();
+}
+
 td::Result<std::string> all(std::istringstream&, const StatsCollector& stats) {
   auto m = metrics::collect_all();
 
@@ -288,9 +293,11 @@ td::Result<std::string> process_request(const std::string& request, const StatsC
   // Dispatch table
   using Handler = td::Result<std::string> (*)(std::istringstream&, const StatsCollector&);
   static const std::map<std::string, Handler> dispatch = {
-      {"status", handlers::status}, {"logs", handlers::logs},         {"sys", handlers::sys},
-      {"svc", handlers::svc},       {"tdx", handlers::tdx_cmd},       {"gpu", handlers::gpu},
-      {"all", handlers::all},       {"eventlog", handlers::tdx_eventlog}};
+      {"status", handlers::status}, {"logs", handlers::logs},
+      {"sys", handlers::sys},       {"svc", handlers::svc},
+      {"tdx", handlers::tdx_cmd},   {"gpu", handlers::gpu},
+      {"all", handlers::all},       {"eventlog", handlers::tdx_eventlog},
+      {"sev", handlers::sev_cmd}};
 
   auto it = dispatch.find(command);
   if (it != dispatch.end()) {

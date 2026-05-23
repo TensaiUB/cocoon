@@ -1,7 +1,7 @@
 #pragma once
 #include "td/utils/Status.h"
 #include "td/utils/UInt.h"
-#include "tdx.h"
+#include "tee/cocoon/RATLS.h"
 #include <memory>
 #include <optional>
 
@@ -14,7 +14,7 @@ class AttestationCache {
   virtual ~AttestationCache() = default;
 
   struct CacheEntry {
-    tdx::AttestationData data;
+    RATLSAttestationReport report;
   };
 
   struct Config {
@@ -26,7 +26,7 @@ class AttestationCache {
   virtual std::optional<CacheEntry> get(const td::UInt256& quote_hash) = 0;
 
   // Store attestation result in cache (thread-safe)
-  virtual void put(const td::UInt256& quote_hash, tdx::AttestationData data) = 0;
+  virtual void put(const td::UInt256& quote_hash, RATLSAttestationReport) = 0;
 
   // Create default in-memory cache
   static std::shared_ptr<AttestationCache> create(Config config);

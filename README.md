@@ -13,7 +13,7 @@ This repository contains all the necessary tools and documentation to both serve
 **For Workers:**
 offering GPUs for computation
 
-- **Download**: [Latest worker release](https://ci.cocoon.org/cocoon-worker-release-latest.tar.xz) – Ready-to-run TDX image and setup scripts
+- **Download**: [Latest worker release](https://ci.cocoon.org/cocoon-worker-release-latest.tar.xz) – Ready-to-run TEE image and setup scripts
 - **Setup Guide**: Instructions are included in the release archive ([preview here](scripts/dist-worker/README.md))
 
 **For Developers:**
@@ -32,7 +32,7 @@ Anyone can verify the worker distribution by rebuilding from source. Note that t
 # 2. Generate distribution
 ./scripts/prepare-worker-dist ../cocoon-worker-dist
 
-# 3. Verify the TDX image matches the published release
+# 3. Verify the TEE image matches the published release
 cd ../cocoon-worker-dist
 sha256sum images/prod/{OVMF.fd,image.vmlinuz,image.initrd,image.cmdline}
 # Compare with the published checksums

@@ -15,8 +15,8 @@ class ProxyInboundConnection : public BaseInboundConnection {
  public:
   enum class ConnectionType { Client, Worker };
   ProxyInboundConnection(BaseRunner *runner, const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
-                         TcpClient::ConnectionId connection_id)
-      : BaseInboundConnection(runner, remote_app_type, remote_app_hash, connection_id) {
+                         const td::Bits256 &verified_by, TcpClient::ConnectionId connection_id)
+      : BaseInboundConnection(runner, remote_app_type, remote_app_hash, verified_by, connection_id) {
   }
 
   ProxyRunner *runner();

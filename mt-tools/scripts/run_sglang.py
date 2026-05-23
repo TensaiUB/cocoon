@@ -6,12 +6,14 @@
 # ]
 # ///
 """
-Start sglang server in Docker with automatic cleanup.
+Start sglang or vllm server in Docker with automatic cleanup.
 
 Usage:
-    uv run run_sglang.py                           # Default: tencent/Hunyuan-MT-Chimera-7B
+    uv run run_sglang.py                           # Default: sglang with tencent/Hunyuan-MT-Chimera-7B
     uv run run_sglang.py --model tencent/Hunyuan-MT-7B
     uv run run_sglang.py --port 8001 --tp 2
+    uv run run_sglang.py --backend vllm            # Use vllm instead of sglang
+    uv run run_sglang.py --backend vllm --model meta-llama/Llama-3.1-8B-Instruct
 """
 
 import argparse
@@ -36,8 +38,8 @@ def download_model(model_name: str):
         sys.exit(1)
 
 
-def run_docker(model_name: str, port: int, tp: int, extra_args: list):
-    """Run sglang in Docker and return the process."""
+def run_docker_sglang(model_name: str, port: int, tp: int, extra_args: list):
+    """Build Docker command for sglang."""
     container_name = f"sglang-{model_name.replace('/', '-')}-{port}"
     
     cmd = [
@@ -62,6 +64,47 @@ def run_docker(model_name: str, port: int, tp: int, extra_args: list):
         "--served-model-name", model_name,
         *extra_args
     ]
+    
+    return cmd, container_name
+
+
+def run_docker_vllm(model_name: str, port: int, tp: int, extra_args: list):
+    """Build Docker command for vllm."""
+    container_name = f"vllm-{model_name.replace('/', '-')}-{port}"
+    
+    cmd = [
+        "docker", "run",
+        "--rm",  # Auto-remove container on exit
+        f"--name={container_name}",
+        "--gpus", "all",
+        "--shm-size", "32g",
+        "-p", f"{port}:8000",
+        "-v", f"{os.path.expanduser('~')}/.cache/huggingface:/root/.cache/huggingface",
+        "--ulimit", "nproc=10000",
+        "--privileged",
+        "--ipc=host",
+        "vllm/vllm-openai:latest",
+        "--model", model_name,
+        "--tensor-parallel-size", str(tp),
+        "--trust-remote-code",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--served-model-name", model_name,
+        *extra_args
+    ]
+    
+    return cmd, container_name
+
+
+def run_docker(backend: str, model_name: str, port: int, tp: int, extra_args: list):
+    """Run inference server in Docker and return the process."""
+    if backend == "sglang":
+        cmd, container_name = run_docker_sglang(model_name, port, tp, extra_args)
+    elif backend == "vllm":
+        cmd, container_name = run_docker_vllm(model_name, port, tp, extra_args)
+    else:
+        print(f"[!] Unknown backend: {backend}")
+        sys.exit(1)
     
     print(f"[*] Starting Docker container: {container_name}")
     print(f"[*] Command: {' '.join(cmd)}")
@@ -91,7 +134,9 @@ def run_docker(model_name: str, port: int, tp: int, extra_args: list):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Run sglang server in Docker')
+    parser = argparse.ArgumentParser(description='Run sglang/vllm server in Docker')
+    parser.add_argument('--backend', default='sglang', choices=['sglang', 'vllm'],
+                        help='Inference backend (default: sglang)')
     parser.add_argument('--model', default='tencent/Hunyuan-MT-Chimera-7B',
                         help='Model name (default: tencent/Hunyuan-MT-Chimera-7B)')
     parser.add_argument('--port', type=int, default=8000,
@@ -101,7 +146,7 @@ def main():
     parser.add_argument('--no-download', action='store_true',
                         help='Skip model download')
     parser.add_argument('extra', nargs='*',
-                        help='Extra arguments to pass to sglang')
+                        help='Extra arguments to pass to the server')
     
     args = parser.parse_args()
     
@@ -110,7 +155,7 @@ def main():
         download_model(args.model)
     
     # Run Docker
-    process, container_name = run_docker(args.model, args.port, args.tp, args.extra)
+    process, container_name = run_docker(args.backend, args.model, args.port, args.tp, args.extra)
     
     # Wait for process
     try:
@@ -122,4 +167,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -119,8 +119,10 @@ int main(int argc, char** argv) {
       base_cid = 7;
     } else if (type == "client" || type == "c") {
       base_cid = 4;
+    } else if (type == "key-manager" || type == "k") {
+      base_cid = 8;
     } else {
-      return td::Status::Error(PSLICE() << "Unknown instance type: " << type << ". Use 'worker', 'proxy', or 'client'");
+      return td::Status::Error(PSLICE() << "Unknown instance type: " << type << ". Use 'worker', 'proxy', 'client' or 'key-manager'");
     }
 
     cid = base_cid + instance_num * 10;
@@ -169,6 +171,7 @@ int main(int argc, char** argv) {
     LOG(PLAIN) << "  worker, w      - Worker instances (CID 6, 16, 26, ...)";
     LOG(PLAIN) << "  proxy, p       - Proxy instances (CID 7, 17, 27, ...)";
     LOG(PLAIN) << "  client, c      - Client instances (CID 4, 14, 24, ...)";
+    LOG(PLAIN) << "  key-manager k      - KeyManager instances (CID 8, 18, 28, ...)";
     LOG(PLAIN) << "";
     LOG(PLAIN) << "Examples:";
     LOG(PLAIN) << "  " << argv[0] << " --instance worker status";

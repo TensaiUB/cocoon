@@ -12,8 +12,9 @@ class ClientProxyInfo;
 class ClientProxyConnection : public ProxyOutboundConnection {
  public:
   ClientProxyConnection(BaseRunner *runner, const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash,
-                        TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id)
-      : ProxyOutboundConnection(runner, remote_app_type, remote_app_hash, connection_id, target_id) {
+                        const td::Bits256 &verified_by, TcpClient::ConnectionId connection_id,
+                        TcpClient::TargetId target_id)
+      : ProxyOutboundConnection(runner, remote_app_type, remote_app_hash, verified_by, connection_id, target_id) {
   }
   void send_handshake() override;
   void received_handshake_answer(td::BufferSlice answer);

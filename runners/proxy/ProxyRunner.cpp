@@ -2,6 +2,7 @@
 #include "auto/tl/cocoon_api.h"
 #include "auto/tl/cocoon_api.hpp"
 #include "auto/tl/cocoon_api_json.h"
+#include "boost-http/http.h"
 #include "checksum.h"
 #include "common/bitstring.h"
 #include "errorcode.h"
@@ -9,6 +10,8 @@
 #include "td/actor/actor.h"
 #include "td/utils/Random.h"
 #include "td/utils/SharedSlice.h"
+#include "td/utils/Time.h"
+#include "td/utils/buffer.h"
 #include "td/utils/common.h"
 #include "td/utils/filesystem.h"
 #include "td/db/RocksDb.h"
@@ -18,9 +21,11 @@
 #include "ProxyInboundWorkerConnection.h"
 #include "runners/smartcontracts/Opcodes.hpp"
 #include "git.h"
+#include "boost-http/www-form-urlencoded.h"
 
 #include "cocoon-tl-utils/cocoon-tl-utils.hpp"
 #include "td/utils/format.h"
+#include "td/utils/misc.h"
 #include "td/utils/overloaded.h"
 #include "tl/TlObject.h"
 #include "ton/ton-types.h"
@@ -68,12 +73,16 @@ td::Result<std::shared_ptr<ProxyWorkerInfo>> ProxyRunner::register_worker(
 
 td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> ProxyRunner::register_worker_connection(
     std::shared_ptr<ProxyWorkerInfo> worker, TcpClient::ConnectionId connection_id, const td::Bits256 &worker_hash,
-    std::string model, td::int32 coefficient, td::int32 max_active_requests) {
+    std::string model, td::int32 coefficient, td::int32 max_active_requests, std::string machine_description_json) {
   if (is_disabled()) {
     return td::Status::Error(ton::ErrorCode::notready, "proxy is not participating in this iteration");
   }
-  auto worker_conn = std::make_shared<ProxyWorkerConnectionInfo>(worker, connection_id, worker_hash, model, coefficient,
-                                                                 max_active_requests, true);
+  if (machine_description_json == "") {
+    machine_description_json = "{}";
+  }
+  auto worker_conn =
+      std::make_shared<ProxyWorkerConnectionInfo>(worker, connection_id, worker_hash, model, coefficient,
+                                                  max_active_requests, true, std::move(machine_description_json));
   models_[worker_conn->model_name_base].model_base_name = worker_conn->model_name_base;
   auto it = models_[worker_conn->model_name_base].connections.emplace(connection_id, std::move(worker_conn)).first;
   return it->second;
@@ -300,15 +309,17 @@ void ProxyRunner::on_client_register(const block::StdAddress &client_owner_addre
 
 std::unique_ptr<BaseInboundConnection> ProxyRunner::allocate_inbound_connection(
     TcpClient::ConnectionId connection_id, TcpClient::ListeningSocketId listening_socket_id,
-    const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash) {
+    const RemoteAppType &remote_app_type, const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) {
   if (!is_initialized() || is_disabled()) {
     return nullptr;
   }
 
   if (remote_app_type == remote_app_type_worker()) {
-    return std::make_unique<ProxyInboundWorkerConnection>(this, remote_app_type, remote_app_hash, connection_id);
+    return std::make_unique<ProxyInboundWorkerConnection>(this, remote_app_type, remote_app_hash, verified_by,
+                                                          connection_id);
   } else {
-    return std::make_unique<ProxyInboundClientConnection>(this, remote_app_type, remote_app_hash, connection_id);
+    return std::make_unique<ProxyInboundClientConnection>(this, remote_app_type, remote_app_hash, verified_by,
+                                                          connection_id);
   }
 }
 
@@ -350,13 +361,15 @@ void ProxyRunner::load_config(td::Promise<td::Unit> promise) {
     wallet_private_key_ = std::make_unique<td::Ed25519::PrivateKey>(td::SecureString(conf.node_wallet_key_.as_slice()));
     wallet_public_key_.as_slice().copy_from(wallet_private_key_->get_public_key().move_as_ok().as_octet_string());
 
+    if (conf.connect_to_proxy_via_.size() > 0) {
+      TRY_STATUS(connection_to_proxy_via(conf.connect_to_proxy_via_));
+    }
+
     set_number_of_proxy_connections(0, false);
     set_owner_address(std::move(owner_address));
 
     local_image_hash_unverified_ = conf.image_hash_;
-    if (conf.check_worker_hashes_ || !conf.is_test_) {
-      enable_check_worker_hashes();
-    }
+    set_check_image_hashes(conf.check_worker_hashes_ || !conf.is_test_);
     set_http_access_hash(conf.http_access_hash_);
     set_is_test(conf.is_test_);
 
@@ -495,63 +508,75 @@ void ProxyRunner::custom_initialize(td::Promise<td::Unit> promise) {
         });
   }
 
-  register_custom_http_handler(
-      "/stats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_generate_main(), std::move(promise)); });
-
+  register_custom_http_handler("/stats", [&](http::HttpCallback::RequestType request_type,
+                                             std::vector<std::pair<std::string, std::string>> headers, std::string path,
+                                             std::vector<std::pair<std::string, std::string>> args, std::string body,
+                                             std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+    http_send_static_answer(http_generate_main(), std::move(answer_callback));
+  });
   register_custom_http_handler(
       "/jsonstats",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        http_send_static_answer(http_generate_json_stats(), std::move(promise), "application/json");
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_generate_json_stats(), std::move(answer_callback), "application/json");
       });
-
   register_custom_http_handler(
       "/request/payout",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_payout(get_args["worker"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_payout(get_from_sorted_list(args, "worker")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/withdraw",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_withdraw(), std::move(promise)); });
-
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_withdraw(), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/charge",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) { http_send_static_answer(http_charge(get_args["client"]), std::move(promise)); });
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        http_send_static_answer(http_charge(get_from_sorted_list(args, "client")), std::move(answer_callback));
+      });
   register_custom_http_handler(
       "/request/disable",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        if (request->method() != "POST" && request->method() != "post") {
-          http_send_static_answer(wrap_short_answer_to_http("disable must be a post request"), std::move(promise));
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        if (request_type == http::HttpCallback::RequestType::Post) {
+          http_send_static_answer(http_enable_disable(std::numeric_limits<td::int64>::max()),
+                                  std::move(answer_callback));
         } else {
-          http_send_static_answer(http_enable_disable(std::numeric_limits<td::int64>::max()), std::move(promise));
+          http_send_static_answer(404, "not found", std::move(answer_callback));
         }
       });
   register_custom_http_handler(
       "/request/enable",
-      [&](std::string url, std::map<std::string, std::string> get_args, std::unique_ptr<ton::http::HttpRequest> request,
-          std::shared_ptr<ton::http::HttpPayload> payload,
-          td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>>
-              promise) {
-        if (request->method() != "POST" && request->method() != "post") {
-          http_send_static_answer(wrap_short_answer_to_http("enable must be a post request"), std::move(promise));
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        if (request_type == http::HttpCallback::RequestType::Post) {
+          http_send_static_answer(http_enable_disable(0), std::move(answer_callback));
         } else {
-          http_send_static_answer(http_enable_disable(0), std::move(promise));
+          http_send_static_answer(404, "not found", std::move(answer_callback));
+        }
+      });
+  register_custom_http_handler(
+      "/request/change_worker_model",
+      [&](http::HttpCallback::RequestType request_type, std::vector<std::pair<std::string, std::string>> headers,
+          std::string path, std::vector<std::pair<std::string, std::string>> args, std::string body,
+          std::unique_ptr<http::HttpRequestCallback> answer_callback) {
+        if (request_type == http::HttpCallback::RequestType::Post) {
+          auto post_args = http::parse_x_www_form_urlencoded(body);
+          http_send_static_answer(http_change_worker_model(get_from_sorted_list(post_args, "connection_id"),
+                                                           get_from_sorted_list(post_args, "new_model_name")),
+                                  std::move(answer_callback));
+        } else {
+          http_send_static_answer(404, "not found", std::move(answer_callback));
         }
       });
 }
@@ -897,7 +922,7 @@ void ProxyRunner::on_root_contract_config_update(std::shared_ptr<RunnerConfig> c
     initialize_sc(config, ton::BlockIdExt{}, {});
   }
 
-  if (check_worker_hashes_) {
+  if (check_image_hashes()) {
     for (auto &t : models_) {
       auto it = t.second.connections.begin();
       while (it != t.second.connections.end()) {
@@ -984,7 +1009,7 @@ void ProxyRunner::alarm() {
 
   auto r = runner_config();
   if (r->root_contract_ts < (td::int32)std::time(0) - 7200 && !ton_disabled()) {
-    if (check_worker_hashes()) {
+    if (check_image_hashes()) {
       LOG(FATAL) << "cannot download new config for 7200 seconds: ts=" << r->root_contract_ts;
     } else {
       LOG(WARNING) << "cannot download new config for 7200 seconds: ts=" << r->root_contract_ts;
@@ -1022,7 +1047,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::proxy_queryAnswerPart>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_queryAnswerPart>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       auto it = running_queries_.find(obj->request_id_);
       if (it != running_queries_.end()) {
         td::actor::send_closure(it->second, &ProxyRunningRequest::receive_answer_part, std::move(obj));
@@ -1039,7 +1069,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::proxy_queryAnswerPartError>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_queryAnswerPartError>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       auto it = running_queries_.find(obj->request_id_);
       if (it != running_queries_.end()) {
         td::actor::send_closure(it->second, &ProxyRunningRequest::receive_answer_part_error, std::move(obj));
@@ -1056,7 +1091,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::proxy_queryAnswer>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_queryAnswer>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       auto it = running_queries_.find(obj->request_id_);
       if (it != running_queries_.end()) {
         td::actor::send_closure(it->second, &ProxyRunningRequest::receive_answer, std::move(obj));
@@ -1073,7 +1113,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::proxy_queryAnswerError>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_queryAnswerError>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       auto it = running_queries_.find(obj->request_id_);
       if (it != running_queries_.end()) {
         td::actor::send_closure(it->second, &ProxyRunningRequest::receive_answer_error, std::move(obj));
@@ -1092,7 +1137,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::proxy_QueryAnswerEx>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::proxy_QueryAnswerEx>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       td::Bits256 request_id;
       cocoon_api::downcast_call(*obj, [&](auto &e) { request_id = e.request_id_; });
 
@@ -1112,17 +1162,16 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto R_obj = fetch_tl_object<cocoon_api::client_runQuery>(std::move(query), true);
-      if (R_obj.is_error()) {
-        LOG(ERROR) << "received incorrect object: " << R_obj.move_as_error();
+      auto R = fetch_tl_object<cocoon_api::client_runQuery>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from client: " << R.move_as_error();
         return;
       }
-
-      auto obj = R_obj.move_as_ok();
+      auto obj = R.move_as_ok();
 
       auto ex_obj = ton::create_tl_object<cocoon_api::client_runQueryEx>(
           std::move(obj->model_name_), std::move(obj->query_), obj->max_coefficient_, obj->max_tokens_, obj->timeout_,
-          obj->request_id_, obj->min_config_version_, 0, false);
+          obj->request_id_, obj->min_config_version_, 0, false, td::Bits256::zero());
       forward_query(connection_id, std::move(ex_obj));
       return;
     };
@@ -1134,13 +1183,13 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto R_obj = fetch_tl_object<cocoon_api::client_runQueryEx>(std::move(query), true);
-      if (R_obj.is_error()) {
-        LOG(ERROR) << "received incorrect object: " << R_obj.move_as_error();
+      auto R = fetch_tl_object<cocoon_api::client_runQueryEx>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from client: " << R.move_as_error();
         return;
       }
+      auto obj = R.move_as_ok();
 
-      auto obj = R_obj.move_as_ok();
       forward_query(connection_id, std::move(obj));
       return;
     };
@@ -1152,7 +1201,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::worker_enabledDisabled>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::worker_enabledDisabled>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       static_cast<ProxyInboundWorkerConnection *>(conn)->worker_connection_info()->is_disabled = obj->disabled_;
       return;
     };
@@ -1164,7 +1218,12 @@ void ProxyRunner::receive_message(TcpClient::ConnectionId connection_id, td::Buf
         return;
       }
 
-      auto obj = fetch_tl_object<cocoon_api::worker_newCoefficient>(std::move(query), true).move_as_ok();
+      auto R = fetch_tl_object<cocoon_api::worker_newCoefficient>(std::move(query), true);
+      if (R.is_error()) {
+        LOG(ERROR) << "received malformed message from worker: " << R.move_as_error();
+        return;
+      }
+      auto obj = R.move_as_ok();
       if (obj->new_coefficient_ < 0) {
         fail_connection(connection_id, td::Status::Error(ton::ErrorCode::protoviolation, "bad coefficient value"));
         return;
@@ -1287,12 +1346,6 @@ void ProxyRunner::receive_query(TcpClient::ConnectionId connection_id, td::Buffe
   }
 }
 
-void ProxyRunner::receive_http_request(
-    std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-    td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise) {
-  ton::http::answer_error(ton::http::HttpStatusCode::status_bad_request, "bad request", std::move(promise));
-}
-
 /* CONTROL */
 
 void ProxyRunner::on_receive_transaction(const block::StdAddress &src_address, td::uint32 op, td::uint64 qid) {
@@ -1350,7 +1403,8 @@ void ProxyRunner::run_withdraw() {
 td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> ProxyRunner::choose_connection(const std::string &model_name,
                                                                                       td::int64 tokens_available,
                                                                                       td::int64 max_coefficient,
-                                                                                      td::int64 max_tokens) {
+                                                                                      td::int64 max_tokens,
+                                                                                      td::int32 min_proto_version) {
   LOG(DEBUG) << " max_coefficient=" << max_coefficient << " max_tokens=" << max_tokens
              << " tokens_available=" << tokens_available;
   if (is_disabled()) {
@@ -1376,6 +1430,12 @@ td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> ProxyRunner::choose_conne
     if (x.second->is_disabled) {
       continue;
     }
+
+    auto conn = static_cast<ProxyInboundWorkerConnection *>(get_connection(x.first));
+    if (!conn || conn->proto_version() < min_proto_version) {
+      continue;
+    }
+
     if (x.second->running_queries() >= x.second->max_active_requests) {
       continue;
     }
@@ -1406,12 +1466,23 @@ td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> ProxyRunner::choose_conne
 
 void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
                                 ton::tl_object_ptr<cocoon_api::client_runQueryEx> req) {
-  auto client = static_cast<ProxyInboundClientConnection *>(get_connection(client_connection_id))->client_info();
+  auto client_tcp_connection = static_cast<ProxyInboundClientConnection *>(get_connection(client_connection_id));
+  auto client = static_cast<ProxyInboundClientConnection *>(client_tcp_connection)->client_info();
 
   auto client_request_id = req->request_id_;
   auto fail = [&](td::Status S) {
-    auto res = cocoon::create_serialize_tl_object<cocoon_api::client_queryAnswerError>(
-        S.code(), S.message().str(), client_request_id, ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0));
+    td::BufferSlice res;
+    auto client_proto_version = client_tcp_connection->proto_version();
+    if (client_proto_version > 0) {
+      res = cocoon::create_serialize_tl_object<cocoon_api::client_queryAnswerErrorEx>(
+          client_request_id, S.code(), S.message().str(), 1,
+          ton::create_tl_object<cocoon_api::client_queryFinalInfo>(
+              (client_proto_version >= 2 ? 2 : 0), ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0), "", "",
+              td::Clocks::system(), td::Clocks::system(), td::Clocks::system(), td::Clocks::system()));
+    } else {
+      res = cocoon::create_serialize_tl_object<cocoon_api::client_queryAnswerError>(
+          S.code(), S.message().str(), client_request_id, ton::create_tl_object<cocoon_api::tokensUsed>(0, 0, 0, 0, 0));
+    }
     send_message_to_connection(client_connection_id, std::move(res));
     stats_->requests_rejected++;
   };
@@ -1431,9 +1502,18 @@ void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
     return fail(td::Status::Error(ton::ErrorCode::notready, "client is closing"));
   }
 
+  td::Bits256 encrypted_with = td::Bits256::zero();
+  if ((req->flags_ & 2) && !req->public_key_.is_zero()) {
+    if (!get_private_key(req->public_key_, encrypted_with)) {
+      return fail(
+          td::Status::Error(ton::ErrorCode::error, PSTRING() << "unknown public key " << req->public_key_.to_hex()));
+    }
+  }
+
   auto to_reserve = adjust_tokens(req->max_tokens_ + req->query_.size(), req->max_coefficient_, 10000);
   auto R_worker_connection_id =
-      choose_connection(req->model_name_, client->tokens_available(), (td::uint32)req->max_coefficient_, to_reserve);
+      choose_connection(req->model_name_, client->tokens_available(), (td::uint32)req->max_coefficient_, to_reserve,
+                        encrypted_with.is_zero() ? 0 : 3);
   if (R_worker_connection_id.is_error()) {
     return fail(R_worker_connection_id.move_as_error());
   }
@@ -1454,9 +1534,8 @@ void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
   worker_connection->forwarded_query();
   worker_connection->info->forwarded_query();
 
-  auto client_tcp_connection = static_cast<ProxyInboundClientConnection *>(get_connection(client_connection_id));
   auto worker_tcp_connection =
-      static_cast<ProxyInboundClientConnection *>(get_connection(worker_connection->connection_id));
+      static_cast<ProxyInboundWorkerConnection *>(get_connection(worker_connection->connection_id));
 
   if (!client_tcp_connection || !worker_tcp_connection) {
     return fail(td::Status::Error(ton::ErrorCode::error, PSTRING() << "connection is dead"));
@@ -1465,8 +1544,8 @@ void ProxyRunner::forward_query(TcpClient::ConnectionId client_connection_id,
   auto request = td::actor::create_actor<ProxyRunningRequest>(
                      PSTRING() << "request_" << client_request_id.to_hex() << "_" << request_id.to_hex(), request_id,
                      client_request_id, client_connection_id, client_tcp_connection->proto_version(), client,
-                     worker_tcp_connection->proto_version(), worker_connection, std::move(req->query_), req->timeout_,
-                     req->enable_debug_, to_reserve, actor_id(this), stats_)
+                     worker_tcp_connection->proto_version(), worker_connection, std::move(req->query_), encrypted_with,
+                     req->timeout_, req->enable_debug_, to_reserve, actor_id(this), stats_)
                      .release();
   CHECK(running_queries_.emplace(request_id, request).second);
 }
@@ -1579,6 +1658,28 @@ std::string ProxyRunner::http_withdraw() {
   return wrap_short_answer_to_http("request sent");
 }
 
+std::string ProxyRunner::http_change_worker_model(std::string worker_connection_id, std::string new_model_name) {
+  auto R = td::to_integer_safe<td::int64>(worker_connection_id);
+  if (R.is_error()) {
+    return wrap_short_answer_to_http("worker_connection_id not an integer");
+  }
+  auto conn_id = R.move_as_ok();
+  auto conn = get_connection(conn_id);
+  if (!conn) {
+    return wrap_short_answer_to_http("connection not found");
+  }
+  if (conn->remote_app_type() != remote_app_type_worker()) {
+    return wrap_short_answer_to_http("connection not from worker");
+  }
+  auto w_conn = static_cast<ProxyInboundWorkerConnection *>(conn);
+  if (!w_conn->handshake_is_completed()) {
+    return wrap_short_answer_to_http("connection is not ready");
+  }
+  auto req = create_serialize_tl_object<cocoon_api::worker_changeModel>(new_model_name);
+  send_query_to_connection(conn_id, "changeworkermodel", std::move(req), td::Timestamp::in(60.0), {});
+  return wrap_short_answer_to_http("request sent");
+}
+
 std::string ProxyRunner::http_generate_main() {
   td::StringBuilder sb;
   sb << "<!DOCTYPE html>\n";
@@ -1606,7 +1707,7 @@ std::string ProxyRunner::http_generate_main() {
       if (is_valid) {
         sb << "<span style=\"background-color:Green;\">our hash " << local_image_hash_unverified_.to_hex()
            << " is in root contract</span>";
-      } else if (check_worker_hashes_) {
+      } else if (check_image_hashes()) {
         sb << "<span style=\"background-color:Crimson;\">our hash " << local_image_hash_unverified_.to_hex()
            << " not found in root contract</span>";
       } else {
@@ -1666,13 +1767,14 @@ std::string ProxyRunner::http_generate_main() {
   }
 
   store_wallet_stat(sb);
+  store_known_private_keys(sb);
 
   {
     sb << "<h1>LOCAL CONFIG</h1>\n";
     sb << "<table>\n";
     sb << "<tr><td>root address</td><td>" << address_link(root_contract_address()) << "</td></tr>\n";
     sb << "<tr><td>owner address</td><td>" << address_link(owner_address()) << "</td></tr>\n";
-    sb << "<tr><td>check worker hashes</td><td>" << (check_worker_hashes_ ? "YES" : "NO") << "</td></tr>\n";
+    sb << "<tr><td>check image hashes</td><td>" << (check_image_hashes() ? "YES" : "NO") << "</td></tr>\n";
     sb << "</table>\n";
   }
 
@@ -1721,6 +1823,11 @@ std::string ProxyRunner::http_generate_main() {
         auto &w = *it2.second;
         sb << "<h2>WORKER CONNECTION " << address_link(w.info->worker_owner_address()) << "</h2>\n";
         w.store_stats(sb);
+        sb << "change model: <form method=\"post\" action=\"/request/change_worker_model\">\n"
+           << "<input type=\"text\" id=\"new_model_name\" name=\"new_model_name\">\n"
+           << "<input type=\"hidden\" id=\"connection_id\" name=\"connection_id\" value=\"" << it2.first << "\">\n"
+           << "<input type=\"submit\" id=\"change_worker_model\" name=\"change_worker_model\" value=\"change model\">\n"
+           << "</form></br>\n";
       }
     }
   }
@@ -1747,7 +1854,7 @@ std::string ProxyRunner::http_generate_json_stats() {
     if (cocoon_wallet()) {
       jb.add_element("wallet_balance", cocoon_wallet()->balance());
     }
-    if (check_worker_hashes_ && sc_) {
+    if (check_image_hashes() && sc_) {
       jb.add_element("actual_image_hash",
                      sc_->runner_config()->root_contract_config->has_proxy_hash(local_image_hash_unverified_));
     } else {
@@ -1783,7 +1890,7 @@ std::string ProxyRunner::http_generate_json_stats() {
     jb.start_object("localconfig");
     jb.add_element("root_address", root_contract_address().rserialize(true));
     jb.add_element("owner_address", owner_address().rserialize(true));
-    jb.add_element("check_worker_hashes", check_worker_hashes_);
+    jb.add_element("check_image_hashes", check_image_hashes());
     jb.stop_object();
   }
 

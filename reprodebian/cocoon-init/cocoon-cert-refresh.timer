@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh TDX certificate timer
+Description=Refresh TEE certificate timer
 After=cocoon-ready.target
 
 [Timer]

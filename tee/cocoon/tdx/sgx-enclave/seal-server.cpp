@@ -4,7 +4,7 @@
 //
 // Created by Arseny Smirnov  on 30/07/2025.
 //
-#include "cocoon/tdx.h"
+#include "tee/cocoon/tdx/tdx.h"
 #include "cocoon/utils.h"
 #include "common.h"
 #include "Enclave_u.h"
@@ -35,7 +35,7 @@ namespace cocoon {
 // Constants for SGX operations
 static constexpr size_t MAX_ENCRYPTED_SECRET_SIZE = 128;
 static constexpr size_t ENCLAVE_PUBKEY_SIZE = sizeof(sgx_ec256_public_t);
-static constexpr char DEFAULT_ENCLAVE_PATH[] = "tee/sgx-enclave/enclave.signed.so";
+static constexpr char DEFAULT_ENCLAVE_PATH[] = "tee/cocoon/tdx/sgx-enclave/enclave.signed.so";
 
 class SharedEnclave {
  public:
@@ -75,11 +75,8 @@ class SharedEnclave {
 
 class GetPersistentKeyServer {
  public:
-  explicit GetPersistentKeyServer(tdx::TdxInterfaceRef tdx, std::shared_ptr<SharedEnclave> enclave)
-      : tdx_(std::move(tdx)), enclave_(std::move(enclave)) {
-    if (!tdx_) {
-      LOG(FATAL) << "TDX interface cannot be null";
-    }
+  explicit GetPersistentKeyServer(std::shared_ptr<SharedEnclave> enclave)
+      : enclave_(std::move(enclave)) {
     if (!enclave_) {
       LOG(FATAL) << "SharedEnclave cannot be null";
     }
@@ -101,7 +98,6 @@ class GetPersistentKeyServer {
   }
 
  private:
-  tdx::TdxInterfaceRef tdx_;
   std::shared_ptr<SharedEnclave> enclave_;
 
   /**
@@ -130,7 +126,7 @@ class GetPersistentKeyServer {
     TRY_RESULT(sgx_quote, generate_sgx_quote(sgx_report, quote_size));
 
     // Validate the generated quote
-    TRY_RESULT(attestation_data, tdx_->validate_quote(tdx::Quote{sgx_quote}));
+    TRY_RESULT(p, tdx::sgx_validate_quote(tdx::Quote{sgx_quote}));
     LOG(INFO) << "quote ok";
 
     // Do not log secret material
@@ -236,7 +232,7 @@ class Server : public td::actor::Actor {
         : fd_(td::make_socket_pipe(std::move(fd)))
         , config_(std::move(config))
         , enclave_(std::move(enclave))
-        , server_(tdx::TdxInterface::create(), enclave_) {
+        , server_(enclave_) {
     }
 
    private:
@@ -311,7 +307,7 @@ class Server : public td::actor::Actor {
     auto options = td::actor::ActorOptions().with_name("Listener").with_poll(true);
     listener_ = td::actor::create_actor<td::TcpListener>(options, config_->port_,
                                                          std::make_unique<Callback>(config_, enclave_), "@vsock");
-    auto server = GetPersistentKeyServer(tdx::TdxInterface::create(), enclave_);
+    auto server = GetPersistentKeyServer(enclave_);
   }
   explicit Server(Config config) : config_(std::make_shared<Config>(std::move(config))) {
     LOG(DEBUG) << "server init";

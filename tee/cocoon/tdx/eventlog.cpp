@@ -1,11 +1,11 @@
 /*
- * tdx-eventlog.cpp
+ * eventlog.cpp
  * TDX Event Log (CCEL ACPI Table) parsing and RTMR replay.
  */
 
-#include "tdx-eventlog.h"
-#include "health-metrics.h"
-#include "utils.h"
+#include "tee/cocoon/health-metrics.h"
+#include "tee/cocoon/tdx/eventlog.h"
+#include "tee/cocoon/utils.h"
 
 #include "td/utils/format.h"
 #include "td/utils/Parser.h"
@@ -19,7 +19,6 @@
 #include <openssl/sha.h>
 
 #include <cstring>
-
 
 namespace cocoon::tdx_eventlog {
 
@@ -700,5 +699,4 @@ std::string render_event_log() {
   return out.as_cslice().str();
 }
 
-} // namespace cocoon::tdx_eventlog
-
+}  // namespace cocoon::tdx_eventlog

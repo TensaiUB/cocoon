@@ -1,5 +1,5 @@
 [Unit]
-Description=TDX VLLM proxy
+Description=TEE VLLM proxy
 Wants=vllm.service
 
 [Service]

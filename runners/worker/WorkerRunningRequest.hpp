@@ -4,14 +4,14 @@
 #include "common/bitstring.h"
 #include "errorcode.h"
 #include "runners/BaseRunner.hpp"
-#include "http/http.h"
 #include "td/actor/ActorId.h"
 #include "td/actor/common.h"
 #include "td/utils/Time.h"
 #include "td/utils/buffer.h"
 #include "WorkerStats.h"
 #include "td/utils/port/Clocks.h"
-#include "runners/helpers/CountTokens.hpp"
+#include "runners/helpers/ValidateRequest.h"
+#include "td/utils/port/IPAddress.h"
 #include "tl/TlObject.h"
 #include <memory>
 
@@ -22,9 +22,10 @@ class WorkerRunner;
 class WorkerRunningRequest : public td::actor::Actor {
  public:
   WorkerRunningRequest(td::Bits256 proxy_request_id, TcpClient::ConnectionId proxy_connection_id, td::BufferSlice data,
-                       double timeout, std::string model_base_name, td::int32 coefficient, td::int32 proto_version,
-                       bool enable_debug, std::shared_ptr<RunnerConfig> runner_config,
-                       td::actor::ActorId<WorkerRunner> runner, std::shared_ptr<WorkerStats> stats);
+                       td::Bits256 encrypted_with, double timeout, td::IPAddress http_server_address,
+                       std::string model_base_name, td::int32 coefficient, td::int32 proto_version, bool enable_debug,
+                       std::shared_ptr<RunnerConfig> runner_config, td::actor::ActorId<WorkerRunner> runner,
+                       td::actor::Scheduler *scheduler, std::shared_ptr<WorkerStats> stats);
 
   void start_up() override {
     alarm_timestamp() = td::Timestamp::in(timeout_);
@@ -40,12 +41,12 @@ class WorkerRunningRequest : public td::actor::Actor {
   }
 
   void start_request();
-  void process_request_response(
-      std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>> ans);
+  void process_request_response(td::int32 status_code, std::vector<std::pair<std::string, std::string>> headers,
+                                std::string payload_part, bool payload_is_completed);
   void send_error(td::Status error);
-  void send_answer(std::unique_ptr<ton::http::HttpResponse> response, td::BufferSlice payload,
-                   bool payload_is_completed);
-  void send_payload_part(td::BufferSlice payload_part, bool payload_is_completed);
+  void send_answer(td::int32 status_code, std::vector<std::pair<std::string, std::string>> headers,
+                   std::string payload_part, bool payload_is_completed);
+  void send_payload_part(std::string payload_part, bool payload_is_completed);
   void finish_request(bool is_success);
 
   WorkerStats *stats() {
@@ -68,10 +69,13 @@ class WorkerRunningRequest : public td::actor::Actor {
   TcpClient::ConnectionId proxy_connection_id_;
   td::BufferSlice data_;
   double timeout_;
+  td::IPAddress http_server_address_;
   std::string model_base_name_;
+  td::int32 coefficient_;
   td::int32 proto_version_;
   bool enable_debug_;
   td::actor::ActorId<WorkerRunner> runner_;
+  td::actor::Scheduler *scheduler_;
   std::shared_ptr<WorkerStats> stats_;
 
   td::int32 payload_parts_{0};
@@ -82,7 +86,11 @@ class WorkerRunningRequest : public td::actor::Actor {
   bool completed_{false};
   bool sent_answer_{false};
 
-  std::unique_ptr<TokenCounter> tokens_counter_;
+  td::Bits256 worker_private_key_ = td::Bits256::zero();
+  td::Bits256 client_public_key_ = td::Bits256::zero();
+
+  std::shared_ptr<RunnerConfig> runner_config_;
+  std::unique_ptr<AnswerPostprocessor> postprocessor_;
 };
 
 }  // namespace cocoon

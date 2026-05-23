@@ -6,19 +6,17 @@
 #include "td/net/Socks5.h"
 namespace cocoon {
 
-td::Result<td::SslStream> create_server_ssl_stream(tdx::CertAndKey cert_and_key, tdx::PolicyRef policy) {
-  auto verify_callback = tdx::VerifyCallbackBuilder::from_policy(std::move(policy));
-  TRY_RESULT(ssl_ctx_holder,
-             tdx::create_ssl_ctx({tdx::SslOptions::Mode::Server, std::move(cert_and_key), verify_callback}));
+td::Result<td::SslStream> create_server_ssl_stream(TeeCertAndKey cert_and_key, RATLSPolicyRef policy) {
+  auto verify_callback = RATLSVerifyCallbackBuilder::from_policy(std::move(policy));
+  TRY_RESULT(ssl_ctx_holder, create_ssl_ctx({SslOptions::Mode::Server, std::move(cert_and_key), verify_callback}));
   TRY_RESULT(ssl_ctx, td::SslCtx::create(ssl_ctx_holder.release()));
   return td::SslStream::create_server(std::move(ssl_ctx));
 }
 
-td::Result<td::SslStream> create_client_ssl_stream(td::CSlice host, tdx::CertAndKey cert_and_key, tdx::PolicyRef policy,
+td::Result<td::SslStream> create_client_ssl_stream(td::CSlice host, TeeCertAndKey cert_and_key, RATLSPolicyRef policy,
                                                    bool enable_sni) {
-  auto verify_callback = tdx::VerifyCallbackBuilder::from_policy(std::move(policy));
-  TRY_RESULT(ssl_ctx_holder,
-             tdx::create_ssl_ctx({tdx::SslOptions::Mode::Client, std::move(cert_and_key), verify_callback}));
+  auto verify_callback = RATLSVerifyCallbackBuilder::from_policy(std::move(policy));
+  TRY_RESULT(ssl_ctx_holder, create_ssl_ctx({SslOptions::Mode::Client, std::move(cert_and_key), verify_callback}));
   TRY_RESULT(ssl_ctx, td::SslCtx::create(ssl_ctx_holder.release()));
   return td::SslStream::create(host, std::move(ssl_ctx), enable_sni);
 }
@@ -116,44 +114,15 @@ class TlsPipeWorker : public td::actor::Actor {
   td::Observer observer_;
 };
 
-struct PolicyHelper : tdx::Policy {
-  explicit PolicyHelper(tdx::PolicyRef inner_policy,
-                        td::actor::StartedTask<AttestedPeerInfo>::ExternalPromise peer_info_promise,
-                        const td::IPAddress &source, const td::IPAddress &destination)
-      : inner_policy_(std::move(inner_policy))
-      , peer_info_promise_(std::move(peer_info_promise))
-      , source_(source)
-      , destination_(destination) {
-  }
-  td::Result<tdx::AttestationData> validate(const tdx::Quote *quote,
-                                            const tdx::UserClaims &user_claims) const override {
-    auto r_attestation = inner_policy_->validate(quote, user_claims);
-    if (r_attestation.is_ok()) {
-      auto peer_info = make_attested_peer_info(r_attestation.ok(), user_claims, source_, destination_);
-      peer_info_promise_.set_value(std::move(peer_info));
-    } else {
-      peer_info_promise_.set_error(r_attestation.error().clone());
-    }
-    return r_attestation;
-  }
-
- private:
-  tdx::PolicyRef inner_policy_;
-  mutable td::actor::StartedTask<AttestedPeerInfo>::ExternalPromise peer_info_promise_;
-  td::IPAddress source_;
-  td::IPAddress destination_;
-};
-
-td::actor::Task<std::pair<td::Pipe, AttestedPeerInfo>> wrap_tls_client(td::Slice name, td::Pipe pipe,
-                                                                       tdx::CertAndKey cert_and_key,
-                                                                       tdx::PolicyRef policy,
-                                                                       const td::IPAddress &source,
-                                                                       const td::IPAddress &destination) {
-  auto [t_peer_info, p_peer_info] = td::actor::StartedTask<AttestedPeerInfo>::make_bridge();
-  auto new_policy = std::make_shared<PolicyHelper>(std::move(policy), std::move(p_peer_info), source, destination);
-
-  auto ssl_stream =
-      co_await create_client_ssl_stream("127.0.0.1", std::move(cert_and_key), std::move(new_policy), true);
+td::actor::Task<std::pair<td::Pipe, RATLSAttestedPeerInfo>> wrap_tls_client(td::Slice name, td::Pipe pipe,
+                                                                            TeeCertAndKey cert_and_key,
+                                                                            RATLSPolicyRef policy,
+                                                                            const td::IPAddress &source,
+                                                                            const td::IPAddress &destination) {
+  auto [t_peer_info, p_peer_info] = td::actor::StartedTask<RATLSAttestedPeerInfo>::make_bridge();
+  auto ssl_stream = co_await create_client_ssl_stream(
+      "127.0.0.1", std::move(cert_and_key),
+      std::make_shared<RATLSPolicyHelper>(std::move(policy), std::move(p_peer_info), source, destination), true);
   auto proxy = td::actor::create_actor<TlsPipeWorker>(PSLICE() << "TlsPipeWorker" << name, std::move(pipe),
                                                       std::move(ssl_stream))
                    .release();
@@ -162,15 +131,15 @@ td::actor::Task<std::pair<td::Pipe, AttestedPeerInfo>> wrap_tls_client(td::Slice
   co_return std::make_pair(std::move(tls_pipe), std::move(peer_info));
 }
 
-td::actor::Task<std::pair<td::Pipe, AttestedPeerInfo>> wrap_tls_server(td::Slice name, td::Pipe pipe,
-                                                                       tdx::CertAndKey cert_and_key,
-                                                                       tdx::PolicyRef policy,
-                                                                       const td::IPAddress &source,
-                                                                       const td::IPAddress &destination) {
-  auto [t_peer_info, p_peer_info] = td::actor::StartedTask<AttestedPeerInfo>::make_bridge();
-  auto new_policy = std::make_shared<PolicyHelper>(std::move(policy), std::move(p_peer_info), source, destination);
-
-  auto ssl_stream = co_await create_server_ssl_stream(std::move(cert_and_key), std::move(new_policy));
+td::actor::Task<std::pair<td::Pipe, RATLSAttestedPeerInfo>> wrap_tls_server(td::Slice name, td::Pipe pipe,
+                                                                            TeeCertAndKey cert_and_key,
+                                                                            RATLSPolicyRef policy,
+                                                                            const td::IPAddress &source,
+                                                                            const td::IPAddress &destination) {
+  auto [t_peer_info, p_peer_info] = td::actor::StartedTask<RATLSAttestedPeerInfo>::make_bridge();
+  auto ssl_stream = co_await create_server_ssl_stream(
+      std::move(cert_and_key),
+      std::make_shared<RATLSPolicyHelper>(std::move(policy), std::move(p_peer_info), source, destination));
   auto proxy = td::actor::create_actor<TlsPipeWorker>(PSLICE() << "TlsPipeWorker" << name, std::move(pipe),
                                                       std::move(ssl_stream))
                    .release();
@@ -191,33 +160,4 @@ td::StringBuilder &operator<<(td::StringBuilder &sb, const ProxyState &state) {
   return sb;
 }
 
-AttestedPeerInfo make_attested_peer_info(const tdx::AttestationData &attestation, const tdx::UserClaims &user_claims,
-                                         const td::IPAddress &source, const td::IPAddress &destination) {
-  AttestedPeerInfo info;
-  info.attestation_data = attestation;
-  info.user_claims = user_claims;
-  info.source_ip = source.get_ip_str().str();
-  info.source_port = source.get_port();
-  info.destination_ip = destination.get_ip_str().str();
-  info.destination_port = destination.get_port();
-  return info;
-}
-
-td::StringBuilder &operator<<(td::StringBuilder &sb, const AttestedPeerInfo &info) {
-  sb << "AttestedPeerInfo{";
-  sb << "src=" << info.source_ip << ":" << info.source_port;
-  sb << ", dst=" << info.destination_ip << ":" << info.destination_port;
-  sb << ", type=" << info.attestation_data.short_description();
-
-  // Show short image hash instead of full attestation data
-  if (!info.attestation_data.is_empty()) {
-    auto hash = info.attestation_data.image_hash();
-    sb << ", image_hash=" << td::hex_encode(hash.as_slice()).substr(0, 16) << "..";
-  }
-
-  // Show public key (uses operator<< which already formats it nicely)
-  sb << ", pubkey=" << info.user_claims.public_key;
-  sb << "}";
-  return sb;
-}
 }  // namespace cocoon

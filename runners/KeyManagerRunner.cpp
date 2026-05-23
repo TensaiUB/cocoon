@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
 
   scheduler.run_in_context([&] {
     key_manager_runner =
-        td::actor::create_actor<cocoon::KeyManagerRunner>("key-manager", std::move(engine_config_filename));
+        td::actor::create_actor<cocoon::KeyManagerRunner>("key-manager", std::move(engine_config_filename), &scheduler);
     td::actor::send_lambda(key_manager_runner, [&]() {
       auto &ptr = key_manager_runner.get_actor_unsafe();
       if (pseudo_config_filename.size() > 0) {

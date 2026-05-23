@@ -8,7 +8,7 @@
 #include "td/utils/BufferedFd.h"
 #include "td/utils/optional.h"
 #include "td/utils/format.h"
-#include "tdx.h"
+#include "tee/cocoon/tdx/tdx.h"
 #include "utils.h"
 #include "td/net/Pipe.h"
 #include "td/net/utils.h"
@@ -38,7 +38,7 @@ struct AcceptAndProxy : td::TaskActor<ProxyState> {
     auto [tls_socket, peer_info] =
         co_await wrap_tls_server("-Rev-" + desc, std::move(client_pipe), config_->cert_and_key_.load(),
                                  config_->policy_, state_.source_.value(), state_.destination_.value());
-    state_.set_attestation(peer_info.attestation_data);
+    state_.set_attestation(peer_info.report());
 
     auto dst_pipe = make_socket_pipe(co_await td::SocketFd::open(config_->dst_));
 

@@ -9,8 +9,13 @@ import (
 )
 
 func stream(w http.ResponseWriter, r *http.Request) {
-	io.Copy(io.Discard, r.Body)
-	r.Body.Close()
+  defer r.Body.Close()
+  body, _ := io.ReadAll(r.Body)
+  bodyString := string(body)
+
+  if false {
+    fmt.Println("body=", bodyString)
+  }
 
 	q := r.URL.Query()
 	chunks, _ := strconv.Atoi(q.Get("chunks"))
@@ -26,6 +31,7 @@ func stream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	flusher, _ := w.(http.Flusher)
 
+  fmt.Fprintf(w, `{"chunks":%d,"bytes":%d,"delay":%d}`+"\n", chunks, bytesPer, delayMs)
 	for i := 0; i < chunks; i++ {
 		fmt.Fprintf(w, `{"delta":"%0*s","i":%d}`+"\n", bytesPer, "", i)
 		flusher.Flush()
@@ -34,12 +40,25 @@ func stream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
   fmt.Fprintf(w, `{"usage":{"prompt_tokens":34,"total_tokens":134,"completion_tokens":100,"completion_tokens_details":{"reasoning_tokens":10},"prompt_tokens_details":{"cached_tokens":11}}}`+"\n")
+	flusher.Flush()
+}
+
+func nostream(w http.ResponseWriter, r *http.Request) {
+  defer r.Body.Close()
+  io.ReadAll(r.Body)
+
+	w.Header().Set("Content-Type", "application/json")
+	flusher, _ := w.(http.Flusher)
+
+  fmt.Fprintf(w, "{}\n")
+	flusher.Flush()
 }
 
 func main() {
 	http.HandleFunc("/v1/chat/completions", stream)
+	http.HandleFunc("/v1/audio/transcriptions", stream)
 	http.HandleFunc("/v1/completions", stream)
-	http.HandleFunc("/v1/models", stream)
+	http.HandleFunc("/v1/models", nostream)
 	fmt.Println("Server listening on :8000")
 	http.ListenAndServe(":8000", nil)
 }

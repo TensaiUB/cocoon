@@ -41,7 +41,7 @@ void CertManager::check_and_reload() {
   }
 
   LOG(INFO) << "Certificate files changed, reloading...";
-  auto r_cert = tdx::load_cert_and_key(config_.cert_base_name);
+  auto r_cert = load_cert_and_key(config_.cert_base_name);
   if (r_cert.is_error()) {
     LOG(ERROR) << "Failed to reload certificates: " << r_cert.error();
     return;

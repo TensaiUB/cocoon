@@ -24,10 +24,10 @@ class InMemoryAttestationCache final : public AttestationCache {
     return *entry;
   }
 
-  void put(const td::UInt256& quote_hash, tdx::AttestationData data) override {
+  void put(const td::UInt256& quote_hash, RATLSAttestationReport report) override {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    cache_.put(quote_hash, CacheEntry{std::move(data)});
+    cache_.put(quote_hash, CacheEntry{std::move(report)});
 
     LOG(DEBUG) << "Cached attestation for quote hash " << td::hex_encode(quote_hash.as_slice());
   }

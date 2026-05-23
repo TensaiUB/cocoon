@@ -1,9 +1,9 @@
-#include "pow.h"
-#include "tdx.h"
-#include "utils.h"
 #include "td/actor/coro.h"
 #include "td/net/Pipe.h"
 #include "td/utils/OptionParser.h"
+#include "tee/cocoon/pow.h"
+#include "tee/cocoon/tdx/tdx.h"
+#include "tee/cocoon/utils.h"
 
 td::actor::Task<td::Unit> check_task(td::actor::Task<td::Unit> t) {
   auto r = (co_await std::move(t).wrap());
@@ -15,8 +15,8 @@ td::actor::Task<td::Unit> check_task(td::actor::Task<td::Unit> t) {
   co_return td::Unit();
 }
 
-td::actor::Task<td::Unit> run(td::CSlice host, td::int32 port, bool fake_tdx) {
-  auto tdx = fake_tdx ? tdx::TdxInterface::create_fake() : tdx::TdxInterface::create();
+td::actor::Task<td::Unit> run(td::CSlice host, td::int32 port, bool fake_tee) {
+  auto tdx = fake_tee ? tdx::TdxInterface::create_fake() : tdx::TdxInterface::create();
   td::IPAddress ip_address;
   co_await ip_address.init_host_port(host, port);
   auto cert = tdx::generate_cert_and_key(nullptr);
@@ -36,10 +36,10 @@ int main(int argc, char **argv) {
   SET_VERBOSITY_LEVEL(VERBOSITY_NAME(DEBUG));
 
   td::OptionParser option_parser;
-  bool fake_tdx = false;
+  bool fake_tee = false;
 
-  option_parser.add_checked_option('f', "fake-tdx", "port", [&]() {
-    fake_tdx = true;
+  option_parser.add_checked_option('f', "fake-tee", "port", [&]() {
+    fake_tee = true;
     return td::Status::OK();
   });
 
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
 
   sched.run_in_context([&] {
     // Create proxy actors for each configured port
-    check_task(run(host, port, fake_tdx)).start().detach("check_task");
+    check_task(run(host, port, fake_tee)).start().detach("check_task");
   });
 
   LOG(INFO) << "Proxies started";

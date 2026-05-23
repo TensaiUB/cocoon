@@ -1,0 +1,13 @@
+[Unit]
+Description=TEE router
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/router -R 13001:localhost:13101@tee --serialize-info -C /etc/tee/tee
+StandardOutput=journal+console
+StandardError=journal+console
+
+# Resource accounting (for health-monitor)
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes

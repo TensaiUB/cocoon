@@ -311,14 +311,23 @@ set(COMMON_SOURCE
  runners/BaseRunner.cpp runners/smartcontracts/RootContractConfig.cpp runners/smartcontracts/SmartContract.cpp net/TcpConnection.cpp net/TcpClient.cpp 
  runners/smartcontracts/CocoonWallet.cpp runners/smartcontracts/ProxyContract.cpp runners/smartcontracts/ClientContract.cpp 
  runners/smartcontracts/WorkerContract.cpp runners/helpers/CountTokens.cpp runners/helpers/HttpSender.cpp runners/TonlibWrapper.cpp
+ runners/helpers/ValidateRequest.cpp
+
+ boost-http/http.cpp
+ boost-http/http-client.cpp
+ boost-http/www-form-urlencoded.cpp
+
+ third-party/multipart-parser-c/multipart_parser.c
 )
 
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")
 add_subdirectory(third-party/nlohmann-json)
+find_package(Boost 1.71 REQUIRED COMPONENTS thread)
+
 
 set(COMMON_LIBRARIES
-  tdutils tdactor tdnet tddb cocoon_tl_api tl_api cocoon-tl-utils tonhttp tonlib tdnet_ported cocoon git nlohmann_json::nlohmann_json
+  tdutils tdactor tdnet tddb cocoon_tl_api tl_api cocoon-tl-utils tonhttp tonlib tdnet_ported cocoon git nlohmann_json::nlohmann_json Boost::headers Boost::thread
 )
 
 add_library(cocoon_common ${COMMON_SOURCE})
@@ -352,7 +361,6 @@ add_executable(worker-runner
   runners/worker/WorkerRunner.cpp 
   runners/worker/WorkerRunningRequest.cpp
   runners/worker/WorkerUplinkMonitor.cpp
-  runners/helpers/ValidateRequest.cpp
   )
 target_link_libraries(worker-runner PRIVATE cocoon_common )
 add_executable(key-manager-runner 
@@ -360,6 +368,10 @@ add_executable(key-manager-runner
   runners/key-manager/KeyManagerRunner.cpp
   )
 target_link_libraries(key-manager-runner PRIVATE cocoon_common )
+add_executable(encrypt-message 
+  runners/EncryptMessage.cpp
+  )
+target_link_libraries(encrypt-message PRIVATE cocoon_common )
 
 # Sync time utility
 add_executable(sync-time runners/utils/sync_time.cpp )
@@ -369,7 +381,7 @@ target_link_libraries(sync-time PRIVATE cocoon_common )
 add_executable(generate-cocoon-wallet-address runners/utils/generate-cocoon-wallet-address.cpp )
 target_link_libraries(generate-cocoon-wallet-address PRIVATE cocoon_common )
 
-add_custom_target(runners DEPENDS client-runner proxy-runner worker-runner sync-time generate-cocoon-wallet-address)
+add_custom_target(runners DEPENDS client-runner proxy-runner worker-runner key-manager-runner sync-time generate-cocoon-wallet-address)
 
 # Build everything needed for cocoon-launch
 set(COCOON_ALL_DEPS runners cocoon-subst router gen-cert)

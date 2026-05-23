@@ -32,10 +32,16 @@ void ProxyInboundWorkerConnection::receive_handshake_query(td::BufferSlice messa
 
 void ProxyInboundWorkerConnection::receive_connect_to_proxy_query(td::BufferSlice query,
                                                                   td::Promise<td::BufferSlice> promise) {
-  if (runner()->check_worker_hashes()) {
+  if (runner()->check_image_hashes()) {
     if (!runner()->sc()->runner_config()->root_contract_config->has_worker_hash(remote_app_hash())) {
       return promise.set_error(td::Status::Error(
           ton::ErrorCode::protoviolation, PSTRING() << "invalid worker image hash " << remote_app_hash().to_hex()));
+    }
+  }
+  {
+    auto S = runner()->check_verification_key(remote_app_type(), verified_by());
+    if (S.is_error()) {
+      return fail_connection(std::move(S));
     }
   }
   TRY_RESULT_PROMISE(promise, obj, fetch_tl_object<cocoon_api::worker_connectToProxy>(std::move(query), true));
@@ -57,7 +63,7 @@ void ProxyInboundWorkerConnection::receive_connect_to_proxy_query(td::BufferSlic
   if (obj->params_->proxy_cnt_ < 1) {
     return promise.set_error(td::Status::Error(ton::ErrorCode::protoviolation, "invalid proxy_cnt value"));
   }
-  if (runner()->check_worker_hashes()) {
+  if (runner()->check_image_hashes()) {
     if (!runner()->sc()->runner_config()->root_contract_config->has_model_hash(
             td::sha256_bits256(obj->params_->model_))) {
       return promise.set_error(td::Status::Error(ton::ErrorCode::protoviolation,
@@ -84,7 +90,8 @@ void ProxyInboundWorkerConnection::receive_connect_to_proxy_query(td::BufferSlic
       promise, worker_connection_info_,
       runner()->register_worker_connection(
           worker_info_, connection_id(), remote_app_hash(), obj->params_->model_, obj->params_->coefficient_,
-          (obj->params_->max_active_requests_ + obj->params_->proxy_cnt_ - 1) / obj->params_->proxy_cnt_));
+          (obj->params_->max_active_requests_ + obj->params_->proxy_cnt_ - 1) / obj->params_->proxy_cnt_,
+          obj->params_->machine_description_json_));
 
   state_ = State::Compare;
   auto params = ton::create_tl_object<cocoon_api::proxy_params>(

@@ -1,8 +1,8 @@
 [Unit]
-Description=Refresh TDX certificate
+Description=Refresh TEE certificate
 After=cocoon-ready.target
 Requires=cocoon-ready.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/gen-cert-synced --tdx tdx --name /etc/tdx/tdx --force
+ExecStart=/usr/bin/gen-cert-synced --tee tee --name /etc/tee/tee --force

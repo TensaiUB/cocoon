@@ -5,6 +5,7 @@ umask 022
 mkosi-chroot dracut --regenerate-all --zstd --reproducible --add "systemd-veritysetup overlayfs" --force-drivers "ecdsa_generic ecdh" --no-hostonly --omit "virtfs virtiofs"
 mkosi-chroot systemctl enable cocoon-ready.target
 mkosi-chroot systemctl enable cocoon-cert-refresh.timer
+mkosi-chroot systemctl enable cocoon-sev-pki-update.timer
 mkosi-chroot systemctl enable spec.service
 mkosi-chroot systemctl mask apt-daily.timer apt-daily-upgrade.timer dpkg-db-backup.timer
 mkosi-chroot systemctl mask apt-daily.service apt-daily-upgrade.service dpkg-db-backup.service

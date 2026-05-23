@@ -20,6 +20,9 @@ const unsigned int root_upgrade_contracts = 0xa2370f61;
 const unsigned int root_upgrade = 0x11aefd51;
 const unsigned int root_reset = 0x563c1d96;
 const unsigned int root_upgrade_full = 0x4f7c5789;
+const unsigned int root_change_key_manager = 0xb01c0fe9;
+const unsigned int root_add_public_key_signed = 0x9e0e1821;
+const unsigned int root_add_public_key = 0x6e5a646a;
 
 const unsigned int worker_proxy_request = 0x4d725d2c;
 const unsigned int worker_proxy_payout_request = 0x08e7d036;

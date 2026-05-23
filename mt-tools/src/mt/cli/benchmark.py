@@ -444,6 +444,9 @@ def cmd_benchmark(args):
     elif task_name == 'summarize':
         lang = getattr(args, 'lang', 'en') or 'en'
         task = get_task("summarize", lang=lang)
+    elif task_name == 'audio_transcribe':
+        # Audio transcription benchmark
+        return cmd_benchmark_audio_transcribe(args)
     else:
         raise ValueError(f"Unknown task: {task_name}")
     
@@ -505,6 +508,190 @@ def cmd_benchmark(args):
     csv_path = getattr(args, 'csv', None)
     if csv_path:
         save_results_csv(results, inputs, config.model, csv_path)
+
+
+def cmd_benchmark_audio_transcribe(args):
+    """Benchmark audio transcription speed and latency."""
+    from pathlib import Path
+    from mt import config_from_args
+    from mt.tasks.audio_transcribe import AudioTranscribeTask
+    
+    # Get config
+    config = config_from_args(args)
+    endpoint = config.endpoint if config.endpoint else "http://127.0.0.1:8000"
+    model = getattr(args, 'transcribe_model', None) or getattr(args, 'model', None) or 'openai/whisper-large-v3'
+    timeout = config.timeout if config.timeout else 60
+    language = getattr(args, 'transcribe_language', None)
+    
+    concurrency = getattr(args, 'concurrency', 60) or 60
+    max_items = getattr(args, 'max_chunks', None)
+    stats_interval = getattr(args, 'stats_interval', 10) or 10
+    verbose = getattr(args, 'verbose', False)
+    
+    # Get audio inputs
+    audio_dir = getattr(args, 'audio_dir', None)
+    query_file = getattr(args, 'query_file', None)
+    query = getattr(args, 'query', None)
+    langs_str = getattr(args, 'langs', None)
+    langs = [l.strip() for l in langs_str.split(',')] if langs_str else None
+    
+    # Collect audio files
+    audio_files = []
+    
+    if query or query_file:
+        # Single audio file to repeat
+        audio_path = query_file or query
+        if not Path(audio_path).exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        repeat = max_items or 100
+        audio_files = [audio_path] * repeat
+        print(f"Benchmarking single audio file: {audio_path} (x{repeat})")
+    
+    elif audio_dir:
+        # Load from directory
+        audio_dir_path = Path(audio_dir)
+        if not audio_dir_path.exists():
+            raise FileNotFoundError(f"Audio directory not found: {audio_dir}")
+        
+        audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a', '.opus'}
+        
+        if langs:
+            # Load from language subdirectories
+            for lang in langs:
+                lang_dir = audio_dir_path / lang
+                if lang_dir.exists():
+                    for f in sorted(lang_dir.iterdir()):
+                        if f.suffix.lower() in audio_extensions:
+                            audio_files.append(str(f))
+        else:
+            # Load all audio files (including subdirs)
+            for f in sorted(audio_dir_path.rglob("*")):
+                if f.suffix.lower() in audio_extensions:
+                    audio_files.append(str(f))
+        
+        print(f"Found {len(audio_files)} audio files in {audio_dir}")
+    
+    else:
+        raise ValueError(
+            "Audio files required for transcription benchmark.\n"
+            "Use --query-file <audio.wav> or --audio-dir <path>"
+        )
+    
+    if max_items and len(audio_files) > max_items:
+        audio_files = audio_files[:max_items]
+    
+    # Create task
+    task = AudioTranscribeTask(
+        endpoint=endpoint,
+        model=model,
+        timeout=timeout,
+        language=language,
+    )
+    
+    print(f"\n{'=' * 70}")
+    print(f"Audio Transcription Benchmark:")
+    print(f"  Endpoint: {endpoint}")
+    print(f"  Model: {model}")
+    if language:
+        print(f"  Language: {language}")
+    print(f"  Total files: {len(audio_files)}")
+    print(f"  Concurrency: {concurrency}")
+    print(f"  Timeout: {timeout}s")
+    print(f"{'=' * 70}\n")
+    
+    # Run benchmark
+    results = []
+    results_lock = threading.Lock()
+    active_counter = {'count': 0, 'lock': threading.Lock()}
+    start_time = time.time()
+    
+    def get_active():
+        with active_counter['lock']:
+            return active_counter['count']
+    
+    def process_audio(i: int, audio_path: str):
+        with active_counter['lock']:
+            active_counter['count'] += 1
+        
+        request_start = time.time()
+        
+        try:
+            result = task.run(audio_path, config=None)
+            duration = time.time() - request_start
+            
+            with active_counter['lock']:
+                active_counter['count'] -= 1
+            
+            output_len = len(result.output) if result.output else 0
+            active = get_active()
+            
+            print(f"[{i+1}/{len(audio_files)}] ✓ {duration:.2f}s | "
+                  f"{output_len} chars | active: {active}")
+            if verbose and result.output:
+                print(f"  Out: {result.output[:80]}...")
+            
+            return BenchmarkResult(
+                idx=i,
+                input_text=audio_path,
+                duration=duration,
+                success=True,
+                output=result.output[:100] + "..." if result.output and len(result.output) > 100 else result.output,
+                completed_at=time.time() - start_time,
+            )
+        
+        except Exception as e:
+            with active_counter['lock']:
+                active_counter['count'] -= 1
+            
+            duration = time.time() - request_start
+            error_str = str(e)
+            timed_out = "timeout" in error_str.lower()
+            
+            timeout_marker = " [TIMEOUT]" if timed_out else ""
+            print(f"[{i+1}/{len(audio_files)}] ✗{timeout_marker} {duration:.2f}s | {error_str[:50]}")
+            
+            return BenchmarkResult(
+                idx=i,
+                input_text=audio_path,
+                duration=duration,
+                success=False,
+                error=error_str,
+                timed_out=timed_out,
+                completed_at=time.time() - start_time,
+            )
+    
+    # Run with concurrency
+    idx = {'value': 0, 'lock': threading.Lock()}
+    
+    def worker():
+        while True:
+            with idx['lock']:
+                i = idx['value']
+                if i >= len(audio_files):
+                    break
+                idx['value'] += 1
+            
+            result = process_audio(i, audio_files[i])
+            
+            with results_lock:
+                results.append(result)
+                if len(results) % stats_interval == 0:
+                    print_stats(results, time.time() - start_time, len(audio_files), audio_files)
+    
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(worker) for _ in range(concurrency)]
+        for f in as_completed(futures):
+            f.result()
+    
+    total_duration = time.time() - start_time
+    print_stats(results, total_duration, len(audio_files), audio_files, is_final=True)
+    
+    # Save CSV if requested
+    csv_path = getattr(args, 'csv', None)
+    if csv_path:
+        save_results_csv(results, audio_files, model, csv_path)
+    
+    return results
 
 
 def save_results_csv(results: List[BenchmarkResult], inputs: List[str], model: str, path: str):

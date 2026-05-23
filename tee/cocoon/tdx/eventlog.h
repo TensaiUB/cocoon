@@ -1,5 +1,5 @@
 /*
- * tdx-eventlog.h
+ * eventlog.h
  * 
  * TDX Event Log (CCEL ACPI Table) parsing and RTMR replay.
  * Based on TCG PC Client Platform Firmware Profile Specification.
@@ -77,9 +77,9 @@ size_t digest_size(uint16_t alg);
 
 // Event log entry (parsed)
 struct EventLogEntry {
-  uint64_t address;        // Address in memory (log_area_start + offset)
-  size_t length;           // Total length of this entry in bytes
-  uint32_t rtmr_index;     // 0-3 for TDX RTMRs (td_register_index - 1)
+  uint64_t address;     // Address in memory (log_area_start + offset)
+  size_t length;        // Total length of this entry in bytes
+  uint32_t rtmr_index;  // 0-3 for TDX RTMRs (td_register_index - 1)
   uint32_t event_type;
   std::string digest_raw;  // Raw digest bytes (not hex-encoded)
   std::string digest_hex;  // Hex-encoded digest for display
@@ -97,14 +97,14 @@ struct EventLog {
   uint64_t log_area_length;
   std::map<uint16_t, uint16_t> digest_sizes;  // algorithm_id -> size
   std::vector<EventLogEntry> entries;
-  
+
   // Replayed RTMR values (computed from event log)
   std::array<RtmrValue, RTMR_COUNT> replayed_rtmrs;
   bool rtmrs_computed = false;
-  
+
   // Compute RTMRs by replaying all events
   void replay_rtmrs();
-  
+
   // Get events for a specific RTMR
   std::vector<const EventLogEntry*> get_events_for_rtmr(uint32_t rtmr_index) const;
 };
@@ -126,4 +126,3 @@ std::string render_event_log();
 
 }  // namespace tdx_eventlog
 }  // namespace cocoon
-

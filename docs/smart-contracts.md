@@ -24,7 +24,7 @@ Owner Wallet
 
 The root smart contract on TON blockchain contains:
 - List of proxy IPs
-- Allowed image hashes (valid TDX measurements)
+- Allowed image hashes (valid TEE measurements)
 - Supported model hashes
 - Network configuration parameters
 - Smart contract code for workers and proxies
@@ -102,7 +102,7 @@ COCOON uses the `tonlib` C++ library directly (not HTTP API) for:
 
 ## Wallet Management
 
-Workers derive wallet keys from TDX persistent keys (see [Seal Keys](seal-keys.md)).
+Workers derive wallet keys from TEE persistent keys (see [Seal Keys](seal-keys.md)).
 
 Mitigation for key loss: Custom payment channels with timeout fallback.
 

@@ -19,7 +19,8 @@ namespace cocoon {
 
 class WorkerRunner : public BaseRunner {
  public:
-  WorkerRunner(std::string engine_config_filename) : BaseRunner(std::move(engine_config_filename)) {
+  WorkerRunner(std::string engine_config_filename, td::actor::Scheduler *scheduler)
+      : BaseRunner(RunnerRole::Worker, std::move(engine_config_filename), scheduler) {
   }
 
   /* CONST PARAMS */
@@ -33,10 +34,10 @@ class WorkerRunner : public BaseRunner {
     return to_nano(0.2);
   }
   static constexpr td::int32 min_proto_version() {
-    return 1;
+    return 3;
   }
   static constexpr td::int32 max_proto_version() {
-    return 2;
+    return 4;
   }
 
   /* SIMPLE GETTERS */
@@ -58,19 +59,16 @@ class WorkerRunner : public BaseRunner {
   bool is_disabled() const {
     return is_force_disabled_ || !uplink_ok_;
   }
-  bool need_check_proxy_hash() const {
-    return need_check_proxy_hash_;
-  }
   auto max_active_requests() const {
     return max_active_requests_;
+  }
+  const auto &machine_description_json() const {
+    return machine_description_json_;
   }
 
   /* SIMPLE SETTERS */
   void set_owner_address(block::StdAddress owner_address) {
     owner_address_ = owner_address;
-  }
-  void enable_check_proxy_hash() {
-    need_check_proxy_hash_ = true;
   }
   void set_http_ready(bool value) {
     http_is_ready_ = value;
@@ -99,10 +97,13 @@ class WorkerRunner : public BaseRunner {
   }
 
   /* ALLOCATORS */
-  std::unique_ptr<ProxyOutboundConnection> allocate_proxy_outbound_connection(
-      TcpClient::ConnectionId connection_id, TcpClient::TargetId target_id, const RemoteAppType &remote_app_type,
-      const td::Bits256 &remote_app_hash) override {
-    return std::make_unique<WorkerProxyConnection>(this, remote_app_type, remote_app_hash, connection_id, target_id);
+  std::unique_ptr<ProxyOutboundConnection> allocate_proxy_outbound_connection(TcpClient::ConnectionId connection_id,
+                                                                              TcpClient::TargetId target_id,
+                                                                              const RemoteAppType &remote_app_type,
+                                                                              const td::Bits256 &remote_app_hash,
+                                                                              const td::Bits256 &verified_by) override {
+    return std::make_unique<WorkerProxyConnection>(this, remote_app_type, remote_app_hash, verified_by, connection_id,
+                                                   target_id);
   }
   std::unique_ptr<ProxyTarget> allocate_proxy_target(TcpClient::TargetId target_id,
                                                      const td::IPAddress &addr) override {
@@ -122,10 +123,6 @@ class WorkerRunner : public BaseRunner {
   void receive_message(TcpClient::ConnectionId connection_id, td::BufferSlice query) override;
   void receive_query(TcpClient::ConnectionId connection_id, td::BufferSlice query,
                      td::Promise<td::BufferSlice> promise) override;
-  void receive_http_request(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise)
-      override;
 
   /* PROXY DB */
   std::shared_ptr<WorkerProxyInfo> get_proxy_info(const std::string &proxy_sc_address_str) const {
@@ -146,6 +143,7 @@ class WorkerRunner : public BaseRunner {
   void set_force_disabled(bool value);
   void send_state_update_to_proxies();
   void set_coefficient(td::int32 value);
+  td::Status change_model(std::string new_model);
 
   /* UPLINK */
   void set_uplink_is_ok(bool value);
@@ -171,6 +169,9 @@ class WorkerRunner : public BaseRunner {
   }
   std::string http_worker_change_coefficient();
   std::string http_worker_change_coefficient(td::CSlice str) {
+    if (str == "") {
+      return http_worker_change_coefficient();
+    }
     char *pEnd = NULL;
     double d = strtod(str.c_str(), &pEnd);
     if (*pEnd) {
@@ -213,11 +214,13 @@ class WorkerRunner : public BaseRunner {
   bool http_is_ready_{false};
   bool is_force_disabled_{false};
   bool uplink_ok_{false};
-  bool need_check_proxy_hash_{false};
   td::uint32 params_version_{0};
   std::shared_ptr<WorkerStats> stats_ = std::make_shared<WorkerStats>();
 
   td::Bits256 local_image_hash_unverified_;
+
+  std::string change_model_script_;
+  std::string machine_description_json_;
 };
 
 }  // namespace cocoon

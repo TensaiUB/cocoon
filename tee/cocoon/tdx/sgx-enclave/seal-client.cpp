@@ -6,8 +6,8 @@
 // Created by Arseny Smirnov  on 30/07/2025.
 //
 
-#include "cocoon/tdx.h"
-#include "cocoon/utils.h"
+#include "tee/cocoon/tdx/tdx.h"
+#include "tee/cocoon/utils.h"
 #include "common.h"
 #include "td/actor/actor.h"
 #include "td/net/TcpListener.h"
@@ -48,11 +48,8 @@ class GetPersistentKeyClient {
     std::string key_name;  ///< Key name for derivation
   };
 
-  explicit GetPersistentKeyClient(tdx::TdxInterfaceRef tdx, Config config)
-      : tdx_(std::move(tdx)), config_(std::move(config)) {
-    if (!tdx_) {
-      LOG(FATAL) << "TDX interface cannot be null";
-    }
+  explicit GetPersistentKeyClient(Config config)
+      : config_(std::move(config)) {
   }
   /**
    * Generates a request for a persistent key.
@@ -69,7 +66,7 @@ class GetPersistentKeyClient {
     report_data.as_mutable_slice().substr(SHA256_SIZE).fill_zero();
 
     // Generate TDX report
-    TRY_RESULT(report, tdx_->make_report(report_data));
+    TRY_RESULT(report, tdx::tdx_make_report(report_data));
 
     return td::serialize(
         GetPersistentKey{.tdx_report = report.raw_report, .public_key = public_key_, .key_name = config_.key_name});
@@ -98,14 +95,9 @@ class GetPersistentKeyClient {
    * Validates the SGX quote and checks report data integrity.
    */
   td::Result<tdx::SgxAttestationData> validate_sgx_quote(const PersistentKey &response) {
-    auto tdx = tdx::TdxInterface::create();
-    TRY_RESULT(attestation_data, tdx->validate_quote(tdx::Quote{response.sgx_quote}));
+    TRY_RESULT(p, tdx::sgx_validate_quote(tdx::Quote{response.sgx_quote}));
 
-    if (!attestation_data.is_sgx()) {
-      return td::Status::Error("Response does not contain SGX attestation data");
-    }
-
-    auto sgx_attestation_data = attestation_data.as_sgx();
+    const auto& [sgx_attestation_data, _] = p;
 
     // Verify report data integrity
     td::UInt512 expected_report_data;
@@ -234,7 +226,6 @@ class GetPersistentKeyClient {
   }
 
  private:
-  tdx::TdxInterfaceRef tdx_;
   Config config_;
   struct EvpPkeyFree {
     void operator()(EVP_PKEY *key) const {
@@ -303,7 +294,7 @@ class Client : public td::actor::Actor {
   explicit Client(td::BufferedFd<td::SocketFd> fd, Config config)
       : fd_(td::make_socket_pipe(std::move(fd)))
       , config_(std::move(config))
-      , client_(tdx::TdxInterface::create(), config_.client_config) {
+      , client_(config_.client_config) {
   }
 
  private:

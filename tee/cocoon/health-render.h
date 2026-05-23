@@ -41,6 +41,10 @@ namespace render_gpu {
 std::string get_metrics();
 }
 
+namespace render_sev {
+std::string get_status();
+}
+
 std::string render_system_metrics(const SystemMetrics& m, const StatsCollector& stats);
 
 }  // namespace cocoon

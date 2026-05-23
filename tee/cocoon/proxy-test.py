@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#   "paramiko", "requests[socks]"
+# ]
+# ///
 """
 proxy-test.py  –  local or hybrid (local+SSH) test harness using unified router
 
@@ -150,18 +156,18 @@ def build_local():
     subprocess.run(["ninja", "gen-cert", "router", "seal-server", "seal-client", "health-monitor", "health-client"], check=True)
 
 
-def generate_certificate(node: Node, cocoon_path: str, tdx_mode: str, cert_name: str) -> None:
+def generate_certificate(node: Node, cocoon_path: str, tee_mode: str, cert_name: str) -> None:
     """Generate certificate with proper permissions handling."""
-    if tdx_mode == 'tdx':
+    if tee_mode == 'tee':
         sudo = "sudo "
         # Generate with sudo
-        node.run(f"{sudo}{cocoon_path}/gen-cert --tdx {tdx_mode} --name {cert_name} --force")
+        node.run(f"{sudo}{cocoon_path}/gen-cert --tee {tee_mode} --name {cert_name} --force")
         # Fix permissions to make readable by current user
         current_user = node.get_user()
         node.run(f"sudo chown {current_user}:{current_user} {cert_name}_key.pem")
         node.run(f"sudo chown {current_user}:{current_user} {cert_name}_cert.pem")
     else:
-        node.run(f"{cocoon_path}/gen-cert --tdx {tdx_mode} --name {cert_name} --force")
+        node.run(f"{cocoon_path}/gen-cert --tee {tee_mode} --name {cert_name} --force")
 
 
 def proxy_url(userpass: str) -> str:
@@ -242,7 +248,7 @@ def run_health_test(local: Node, remote: Node, cocoon: Path, vsock_port: int = 9
         ("sys", "sys", "System metrics (CPU, memory, disk, network)"),
         ("svc ssh", "svc ssh", "Detailed service info with logs"),
         ("logs ssh 50", "logs ssh 50", "Service logs (50 lines)"),
-        ("tdx", "tdx", "TDX attestation status (image hash + RTMRs)"),
+        ("tee", "tee", "TEE attestation status (image hash)"),
         ("gpu", "gpu", "GPU metrics (may fail if no GPU)"),
         ("all", "all", "All metrics in one view"),
     ]
@@ -331,7 +337,7 @@ def create_remote_config(rev_policy: str, cert_name: str, rev_proxy_port: int) -
 
 
 def run_proxy_test(local: Node, remote: Node, cocoon: Path,
-                   fwd_tdx: str = "fake_tdx", rev_tdx: str = "fake_tdx",
+                   fwd_tee: str = "fake_tee", rev_tee: str = "fake_tee",
                    rev_policy: str = "any", fwd_policy: str = "",
                    local_config: str = None, remote_config: str = None) -> None:
     """Unified proxy test function supporting both CLI args and config files.
@@ -354,8 +360,8 @@ def run_proxy_test(local: Node, remote: Node, cocoon: Path,
     print(f"Target is {'remote' if is_remote else 'local'}")
 
     # Generate certificates for each node
-    local_cert = f"local_proxy_{fwd_tdx}"
-    target_cert = f"target_proxy_{rev_tdx}"
+    local_cert = f"local_proxy_{fwd_tee}"
+    target_cert = f"target_proxy_{rev_tee}"
 
     # Setup target node if remote
     if is_remote:
@@ -368,9 +374,9 @@ def run_proxy_test(local: Node, remote: Node, cocoon: Path,
         cocoon_target = cocoon
 
     print(f"Generating local certificate: {local_cert}")
-    generate_certificate(local, str(cocoon), fwd_tdx if fwd_tdx != 'none' else 'fake_tdx', local_cert)
+    generate_certificate(local, str(cocoon), fwd_tee if fwd_tee != 'none' else 'fake_tee', local_cert)
     print(f"Generating target certificate: {target_cert}")
-    generate_certificate(target_node, str(cocoon_target), rev_tdx if rev_tdx != 'none' else 'fake_tdx', target_cert)
+    generate_certificate(target_node, str(cocoon_target), rev_tee if rev_tee != 'none' else 'fake_tee', target_cert)
 
     # Kill any existing processes
     print("Killing existing processes")
@@ -428,11 +434,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Test harness for unified router tool")
     ap.add_argument("--remote", metavar="USER@HOST", help="Remote SSH host for reverse proxy and seal-client")
     ap.add_argument("--ssh-port", type=int, default=22, help="SSH port (default 22)")
-    ap.add_argument("--fwd-tdx", choices=["none", "fake_tdx", "tdx"], default="fake_tdx",
-                    help="TDX mode for forward proxy certificate")
-    ap.add_argument("--rev-tdx", choices=["none", "fake_tdx", "tdx"], default="fake_tdx",
-                    help="TDX mode for reverse proxy certificate")
-    ap.add_argument("--rev-policy", choices=["any", "fake_tdx", "tdx"], default="any",
+    ap.add_argument("--fwd-tee", choices=["none", "fake_tee", "tee"], default="fake_tee",
+                    help="TEE mode for forward proxy certificate")
+    ap.add_argument("--rev-tee", choices=["none", "fake_tee", "tee"], default="fake_tee",
+                    help="TEE mode for reverse proxy certificate")
+    ap.add_argument("--rev-policy", choices=["any", "fake_tee", "tee"], default="any",
                     help="Policy for reverse proxy")
     ap.add_argument("--fwd-policy", default="", help="Policy for forward proxy (empty for 'any')")
     ap.add_argument("--password", default="", help="ssh password for remote node")
@@ -470,7 +476,7 @@ def main() -> None:
             run_health_test(local, remote, cocoon, ns.health_port)
 
         if ns.proxy_test:
-            run_proxy_test(local, remote, cocoon, ns.fwd_tdx, ns.rev_tdx, ns.rev_policy, ns.fwd_policy,
+            run_proxy_test(local, remote, cocoon, ns.fwd_tee, ns.rev_tee, ns.rev_policy, ns.fwd_policy,
                            ns.local_config, ns.remote_config)
 
     finally:

@@ -17,6 +17,7 @@ void ProxyWorkerConnectionInfo::store_stats(td::StringBuilder &sb) {
   sb << "<tr><td>average queries overhead last 10min</td><td>" << average_query_overhead() << "</td></tr>\n";
   sb << "<tr><td>success rate 10min</td><td>" << queries_success_rate() << "</td></tr>\n";
   sb << "<tr><td>allow queries</td><td>" << (is_disabled ? "NO" : "YES") << "</td></tr>\n";
+  sb << "<tr><td>machine description</td><td>" << machine_description_json_ << "</td></tr>\n";
   sb << "</table>\n";
 }
 
@@ -32,6 +33,7 @@ void ProxyWorkerConnectionInfo::store_stats(SimpleJsonSerializer &jb) {
   jb.add_element("worker_queries_time_10m", total_worker_queries_time_());
   jb.add_element("queries_success_10m", total_queries_success_());
   jb.add_element("enabled", !is_disabled);
+  jb.add_element("machine_description", machine_description_json_);
   jb.stop_object();
 }
 

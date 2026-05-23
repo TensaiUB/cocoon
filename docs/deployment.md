@@ -2,16 +2,17 @@
 
 ## Prerequisites
 
-- Linux server (Kernel 6.16+ for full TDX support) with:
-  - Intel TDX-capable CPU
+- Linux server (Kernel 6.16+ for full TDX, SEV support) with:
+  - Intel TDX-capable or AMD SEV-SNP capable CPU
   - NVIDIA GPU with CC support (H100+) (for actual workers)
-  - QEMU with TDX support (10.1+)
+  - QEMU with TDX and SEV-SNP support (10.1+)
 
 **Enable TDX and GPU:**
 
-First you should enable TDX and prepare the GPU for confidential computing. For this you may refer to:
+First you should enable TEE and prepare the GPU for confidential computing. For this you may refer to:
 
 - [Enabling Intel TDX](https://cc-enabling.trustedservices.intel.com/intel-tdx-enabling-guide/03/hardware_selection/) - Probably you will have to enable TDX in BIOS. It could be problematic on machines from cloud providers.
+- [Enabling AMD SEV](https://www.amd.com/content/dam/amd/en/documents/developer/58207-using-sev-with-amd-epyc-processors.pdf)
 - [Enabling CC on NVIDIA GPU](https://github.com/NVIDIA/gpu-admin-tools) - You may have to update your VBIOS for GPU attestation to fully work. Note that it could be complicated as you can't simply download it and would have to contact support
 
 One straightforward way to prepare your hardware is to use the [canonical guide](https://github.com/canonical/tdx), but it could be too specific for general use.

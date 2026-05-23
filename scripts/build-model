@@ -115,7 +115,7 @@ else
         --numeric-owner --owner=0 --group=0 \
         --mode='go+u,go-w'
 
-    if stat --version 2>&1 | grep -q "GNU"; then
+    if stat --version 2>&1 | grep -Eq "GNU|uutils"; then
         FILE_SIZE=$(stat --format=%s "$TMP_TAR")
     else
         FILE_SIZE=$(stat -f%z "$TMP_TAR")

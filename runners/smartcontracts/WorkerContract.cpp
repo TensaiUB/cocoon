@@ -34,7 +34,7 @@ void WorkerContract::on_state_update(ton::tl_object_ptr<ton::tonlib_api::raw_ful
   }
   auto R = vm::std_boc_deserialize(raw_state->data_);
   if (R.is_error()) {
-    LOG(FATAL) << "failed to deserialize contract statge: " << R.move_as_error();
+    LOG(FATAL) << "failed to deserialize contract state: " << R.move_as_error();
     return;
   }
 

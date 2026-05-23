@@ -1,0 +1,8 @@
+[Unit]
+Description=SEV PKI update
+After=cocoon-ready.target
+Requires=cocoon-ready.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sev-pki-update

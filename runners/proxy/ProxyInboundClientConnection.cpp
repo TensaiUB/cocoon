@@ -35,7 +35,7 @@ void ProxyInboundClientConnection::receive_connect_to_proxy_query(td::BufferSlic
                                                                   td::Promise<td::BufferSlice> promise) {
   TRY_RESULT_PROMISE(promise, obj, cocoon::fetch_tl_object<cocoon_api::client_connectToProxy>(message, true));
   if (!(obj->params_->flags_ & 1)) {
-    return promise.set_error(td::Status::Error(ton::ErrorCode::error, "tool old client"));
+    return promise.set_error(td::Status::Error(ton::ErrorCode::error, "too old client"));
   }
   if (obj->params_->is_test_ != runner()->is_test()) {
     return promise.set_error(td::Status::Error(ton::ErrorCode::error, "test mode mismatch"));

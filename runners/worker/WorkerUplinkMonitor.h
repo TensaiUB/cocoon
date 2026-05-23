@@ -4,7 +4,7 @@
 #include "td/actor/common.h"
 #include "td/utils/Random.h"
 #include "td/utils/Time.h"
-#include "ton/http/http.h"
+#include "td/utils/port/IPAddress.h"
 
 namespace cocoon {
 
@@ -12,7 +12,8 @@ class WorkerRunner;
 
 class WorkerUplinkMonitor : public td::actor::Actor {
  public:
-  WorkerUplinkMonitor(td::actor::ActorId<WorkerRunner> runner) : runner_(runner) {
+  WorkerUplinkMonitor(td::IPAddress addr, td::actor::ActorId<WorkerRunner> runner, td::actor::Scheduler *scheduler)
+      : addr_(addr), runner_(runner), scheduler_(scheduler) {
   }
   void alarm() override {
     td::actor::Actor::alarm();
@@ -27,12 +28,13 @@ class WorkerUplinkMonitor : public td::actor::Actor {
   }
 
   void send_request();
-  void got_http_answer(
-      std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>> res);
+  void got_http_answer(td::int32 status_code);
   void requests_completed(bool is_success);
 
  private:
+  td::IPAddress addr_;
   td::actor::ActorId<WorkerRunner> runner_;
+  td::actor::Scheduler *scheduler_;
   td::Timestamp next_check_at_;
   bool cur_state_{false};
 };

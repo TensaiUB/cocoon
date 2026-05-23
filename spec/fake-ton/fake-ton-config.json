@@ -17,6 +17,14 @@
   "proxy_sc_code" : "$PROXY_SC_CODE",
   "worker_sc_code" : "$WORKER_SC_CODE",
   "client_sc_code" : "$CLIENT_SC_CODE",
-  "root_owner_address" : "0QBgPMq7ye2WRcudRHK_-yjHwMXjeN-UCzAuoo06TR6hmgHV"
+  "registered_public_keys" : [
+    {
+      "public_key" : "+2fQ/NM48g4NSVfZ6CrcEB0uNROkSKOrRgUu4biMWBg=", 
+      "key_type" : 1,
+      "expire_at" : 2000000000
+    }
+  ],
+  "root_owner_address" : "0QBgPMq7ye2WRcudRHK_-yjHwMXjeN-UCzAuoo06TR6hmgHV",
+  "key_manager_address" : "$EXTERNAL_IP:$EXTERNAL_KEY_MANAGER_PORT"
 }
 

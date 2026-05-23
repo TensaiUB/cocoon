@@ -18,7 +18,7 @@
 */
 #pragma once
 
-#include "cocoon/tdx.h"
+#include "tee/cocoon/RATLS.h"
 #include "common/bitstring.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/actor/actor.h"
@@ -54,7 +54,7 @@ class TcpConnection : public td::actor::Actor, public td::ObserverBase {
     virtual ~Callback() = default;
     virtual void on_close(td::actor::ActorId<TcpConnection> conn) = 0;
     virtual void on_ready(td::actor::ActorId<TcpConnection> conn, const RemoteAppType &remote_app_type,
-                          const td::Bits256 &remote_app_hash) = 0;
+                          const td::Bits256 &remote_app_hash, const td::Bits256 &verified_by) = 0;
     virtual void on_packet(td::actor::ActorId<TcpConnection> conn, td::BufferSlice data) = 0;
     virtual void on_query(td::actor::ActorId<TcpConnection> conn, td::int64 query_id, td::BufferSlice data) = 0;
     virtual void on_query_answer(td::actor::ActorId<TcpConnection> conn, td::int64 query_id, td::BufferSlice data) = 0;
@@ -111,7 +111,7 @@ class TcpConnection : public td::actor::Actor, public td::ObserverBase {
   void send_ready() {
     LOG(DEBUG) << "tcp: sending ready";
     if (check_ready() && !sent_ready_ && callback_) {
-      callback_->on_ready(self_, remote_app_type_, remote_app_hash_);
+      callback_->on_ready(self_, remote_app_type_, remote_app_hash_, verified_by_);
       sent_ready_ = true;
     }
   }
@@ -130,6 +130,7 @@ class TcpConnection : public td::actor::Actor, public td::ObserverBase {
   std::unique_ptr<Callback> callback_;
   RemoteAppType remote_app_type_;
   td::Bits256 remote_app_hash_ = td::Bits256::zero();
+  td::Bits256 verified_by_ = td::Bits256::zero();
   bool sent_ready_ = false;
   bool received_attestation_ = false;
   bool is_client_;
@@ -143,13 +144,14 @@ class TcpConnection : public td::actor::Actor, public td::ObserverBase {
   void got_fd(td::Result<td::BufferedFd<td::SocketFd>> fdR);
 
   void tls_solved_pow(td::SocketPipe pipe);
-  void tls_created_pipe(td::Pipe pipe, tdx::AttestationData attestation);
+  void tls_created_pipe(td::Pipe pipe, const RATLSAttestationReport &attestation);
 
   void socks5_connected(td::BufferedFd<td::SocketFd> fd);
 
-  void process_attestation(tdx::AttestationData attestation) {
+  void process_attestation(const RATLSAttestationReport &attestation_report) {
     received_attestation_ = true;
-    remote_app_hash_.as_slice().copy_from(attestation.image_hash().as_slice());
+    remote_app_hash_.as_slice().copy_from(attestation_report.image_hash().as_slice());
+    verified_by_ = td::Bits256::zero();
   }
 
   void start();

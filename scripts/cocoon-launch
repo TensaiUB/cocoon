@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-# cocoon-launch - COCOON node launcher (worker/proxy/client, QEMU or local)
+# cocoon-launch - COCOON node launcher (worker/proxy/client/key-manager, QEMU or local)
+import argparse
+import configparser
+import functools
 import os
 import re
-import sys
-import argparse
 import shutil
-import tempfile
-import subprocess
-import configparser
 import signal
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
-from typing import Dict
+from enum import Enum
 from pathlib import Path
+from typing import Dict
 
 
 def run(cmd, **kwargs):
@@ -76,6 +78,7 @@ class Config:
     external_ip: str | None = None
     external_worker_port: int | None = None
     external_client_port: int | None = None
+    external_key_manager_port: int | None = None
     node_wallet_key: str | None = None  # for worker and client
 
     # Runtime control
@@ -109,7 +112,9 @@ class Config:
     ssh_port: int | None = None
     vsock_cid: int | None = None
     tcp_ports: list[int] = field(default_factory=list)
-    no_tdx: bool = False
+    no_tee: bool = False
+    guestfwd_ip : str | None = None
+    guestfwd_ports: list[int] = field(default_factory=list)
 
     # Extra
     extra_vars: Dict[str, str] = field(default_factory=dict)
@@ -126,13 +131,13 @@ class Config:
         # Group fields by category (matching dataclass order)
         sections = [
             ('Common', ['root_contract_address', 'model', 'external_ip', 'external_worker_port',
-                        'external_client_port', 'node_wallet_key']),
+                        'external_client_port', 'external_key_manager_port', 'node_wallet_key']),
             ('Runtime', ['test', 'fake_ton', 'local_mode', 'instance']),
             ('Worker', ['worker_coefficient', 'hf_token']),
             ('TON configs', ['ton_config_base', 'ton_config']),
             ('Paths', ['image_dir', 'build_dir', 'local_run_dir', 'model_tar_path', 'prepared_spec_dir']),
             ('Model', ['model_commit', 'model_verity_hash']),
-            ('QEMU/hardware', ['gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tdx']),
+            ('QEMU/hardware', ['gpu', 'persistent', 'ssh_port', 'vsock_cid', 'tcp_ports', 'no_tee', 'guestfwd_ip', 'guestfwd_ports']),
             ('Extra', ['prepare_only', 'print_only', 'skip_build', 'just_build']),
         ]
 
@@ -191,6 +196,8 @@ class Config:
             vars.setdefault('EXTERNAL_WORKER_PORT', self.external_worker_port + offset)
         if self.external_client_port:
             vars.setdefault('EXTERNAL_CLIENT_PORT', self.external_client_port + offset)
+        if self.external_key_manager_port:
+            vars.setdefault('EXTERNAL_KEY_MANAGER_PORT', self.external_key_manager_port + offset)
         if self.worker_coefficient:
             vars.setdefault('WORKER_COEFFICIENT', self.worker_coefficient)
         if self.hf_token:
@@ -200,6 +207,44 @@ class Config:
 
         return vars
 
+class CPUVendor(Enum):
+    Intel = 1,
+    AMD = 2,
+
+@functools.cache
+def this_cpu_vendor() -> CPUVendor:
+    s = popen(["grep -m1 vendor_id /proc/cpuinfo | awk '{printf $3}'"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = s.communicate ()
+    vendor_id = stdout.strip ()
+
+    match vendor_id:
+        case b'GenuineIntel':
+            return CPUVendor.Intel
+
+        case b'AuthenticAMD':
+            return CPUVendor.AMD
+
+    raise RuntimeError (f"Uknown CPUVendor: {vendor_id} STDOUT:'{stdout}', STDERR:'{stderr}'")
+
+def qemu_confidential_guest_support(cpu_vendor : CPUVendor) -> str:
+    match cpu_vendor:
+        case CPUVendor.Intel:
+            return "tdx"
+
+        case CPUVendor.AMD:
+            return "sev0"
+
+    raise RuntimeError (f"Unknown CPUVendor: {cpu_vendor}")
+
+def qemu_tee_object (cpu_vendor : CPUVendor) -> list[str]:
+    match cpu_vendor:
+        case CPUVendor.Intel:
+            return ['-object', '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}']
+
+        case CPUVendor.AMD:
+            return ['-object', '{"qom-type":"sev-snp-guest","id":"sev0","cbitpos":51,"reduced-phys-bits":1}']
+
+    raise RuntimeError (f"Unknown CPUVendor: {cpu_vendor}")
 
 def load_config_from_file(cli_args) -> Config:
     ini = configparser.ConfigParser()
@@ -230,7 +275,7 @@ def load_config_from_file(cli_args) -> Config:
         return val.lower() in ('true', 'yes', '1', 'on')
 
     script_dir = Path(__file__).parent.parent
-    build_dir = get('build_dir') or os.environ.get('BUILD_DIR') or str(script_dir / 'cmake-build-default-tdx')
+    build_dir = get('build_dir') or os.environ.get('BUILD_DIR') or str(script_dir / 'cmake-build-default-tee')
     prepared_spec_dir = str(Path(tempfile.mkdtemp(prefix='cocoon-spec-')) / 'spec')
 
     if cli_args.local_all:
@@ -257,6 +302,7 @@ def load_config_from_file(cli_args) -> Config:
         external_ip=get('external_ip', '10.0.2.2') if fake_ton else None,
         external_worker_port=getint('external_worker_port', 11001) if fake_ton else None,
         external_client_port=getint('external_client_port', 11002) if fake_ton else None,
+        external_key_manager_port=getint('external_key_manager_port', 13001) if fake_ton else None,
         node_wallet_key=get('node_wallet_key',
                             'gaEatwGNgLGOeFI/TRGfPdJG/K4G8picYHQkDHpLQ9w=' if fake_ton else None),
         # Runtime control
@@ -280,7 +326,7 @@ def load_config_from_file(cli_args) -> Config:
         persistent=get('persistent', f'persistent-{node_type}-{instance}.img'),
         ssh_port=getint('ssh_port', None),
         vsock_cid=getint('vsock_cid', None),
-        no_tdx=cli_args.no_tdx,
+        no_tee=cli_args.no_tee,
         # Extra
         prepare_only=cli_args.prepare_only,
         print_only=cli_args.print_only,
@@ -293,12 +339,19 @@ def load_config_from_file(cli_args) -> Config:
         cfg.tcp_ports = [getint('http_port', 12000)]
         cfg.ssh_port = getint('ssh_port', 12005)
         cfg.vsock_cid = getint('vsock_cid', 6)  # Worker: 6, 16, 26...
+        if cli_args.guestfwd_ip:
+            cfg.guestfwd_ip = cli_args.guestfwd_ip
+            cfg.guestfwd_ports = [11001]
     elif node_type == 'proxy':
         cfg.tcp_ports = [getint('http_port', 11000),
                          getint('worker_rpc_port', 11001),
                          getint('client_rpc_port', 11002)]
         cfg.ssh_port = getint('ssh_port', 11005)
         cfg.vsock_cid = getint('vsock_cid', 7)  # Proxy: 7, 17, 27...
+    elif node_type == 'key-manager':
+        cfg.tcp_ports = [getint('http_port', 13000), getint('key_manager_rpc_port', 13001),]
+        cfg.ssh_port = getint('ssh_port', 13005)
+        cfg.vsock_cid = getint('vsock_cid', 8)  # Worker: 6, 16, 26...
     elif node_type == 'client':
         cfg.local_run_dir = tempfile.mkdtemp(prefix='cocoon-client-')
         cfg.extra_vars.update({
@@ -309,7 +362,7 @@ def load_config_from_file(cli_args) -> Config:
     # Validate
     if not node_type:
         sys.exit('ERROR: type not set in config')
-    if node_type not in ('worker', 'proxy', 'client'):
+    if node_type not in ('worker', 'proxy', 'client', 'key-manager'):
         sys.exit(f'ERROR: Invalid type: {node_type}')
     if not cfg.owner_address:
         sys.exit('ERROR: owner_address required')
@@ -532,7 +585,7 @@ def run_client_local(cfg: Config):
 
 
 def run_qemu(cfg: Config):
-    """Run worker/proxy in QEMU/TDX"""
+    """Run worker/proxy in QEMU/TEE"""
     # Verify GPU
     if cfg.gpu:
         setup_gpu_script = Path(__file__).parent / 'setup-gpu-vfio'
@@ -569,6 +622,10 @@ def run_qemu(cfg: Config):
         netdev += f',hostfwd=tcp::{cfg.ssh_port + offset}-:22'
     for guest_port in cfg.tcp_ports:
         netdev += f',hostfwd=tcp::{guest_port + offset}-:{guest_port}'
+    if cfg.guestfwd_ip and cfg.guestfwd_ports:
+        for guestfwd_port in cfg.guestfwd_ports:
+            netdev += f',guestfwd=tcp::{guestfwd_port}-tcp:{cfg.guestfwd_ip}:{guestfwd_port}'
+
 
     # Read cmdline
     cmdline_file = Path(cfg.image_dir) / 'image.cmdline'
@@ -584,12 +641,15 @@ def run_qemu(cfg: Config):
     if not ovmf.exists():
         sys.exit(f'ERROR: OVMF.fd not found: {ovmf}')
 
-    machine = 'q35,kernel-irqchip=split,memory-backend=mem0'
-    if not cfg.no_tdx:
-        machine += ',confidential-guest-support=tdx'
+    cpu_vendor = this_cpu_vendor ()
 
-    tdx_obj = [] if cfg.no_tdx else ['-object',
-                                     '{"qom-type":"tdx-guest","id":"tdx","quote-generation-socket":{"type":"vsock","cid":"2","port":"4050"}}']
+    machine = 'q35,kernel-irqchip=split,memory-backend=mem0'
+    tee_obj = []
+
+    if not cfg.no_tee:
+        machine += ',confidential-guest-support={0}'.format(qemu_confidential_guest_support(cpu_vendor))
+        tee_obj = qemu_tee_object (cpu_vendor)
+
     gpu_cmd = ['-device', f'vfio-pci,host={cfg.gpu},bus=pci.0,iommufd=iommufd0'] if cfg.gpu else []
     tar_cmd = ['-drive', f'readonly=on,file={model_tar_file},id=drivecache,if=none,index=3,werror=report',
                '-device', 'virtio-blk-pci,drive=drivecache,serial=model-tar',
@@ -601,7 +661,7 @@ def run_qemu(cfg: Config):
             '-bios', str(ovmf),
             '-accel', 'kvm', '-cpu', 'host', '-smp', '32',
             '-vga', 'none',
-            *tdx_obj,
+            *tee_obj,
             '-object', 'memory-backend-ram,id=mem0,size=100G',
             '-device', f'vhost-vsock-pci,guest-cid={vsock_cid}',
             '-object', 'iommufd,id=iommufd0',
@@ -682,6 +742,7 @@ def run_local_all(cfg):
         ('proxy', 'ProxyProxyProxyProxyProxyProxyProxyProxyPro=', 'ml+7xELuOQtfp9q9mSWtHiSWx5aSBV6p3xCfwPmHOwY='),
         ('worker', 'WorkerWorkerWorkerWorkerWorkerWorkerWorkerU=', 'jYYD/HjU0K2D/xpistoFM4BruJhY3koI1xuO00xd7PI='),
         ('client', 'ClientClientClientClientClientClientClientC=', 'gaEatwGNgLGOeFI/TRGfPdJG/K4G8picYHQkDHpLQ9w='),
+        ('key-manager', 'KeyManagerKeyManagerKeyManagerKeyManagerKe0=', '4DV6iMUS16P6Y/6MlF6qfnxii7q2UWXUwSi4bgvcaf8='),
     ]:
         cfg = Config(
             node_type=node_type,
@@ -689,6 +750,7 @@ def run_local_all(cfg):
             external_ip='127.0.0.1',  # Local-all uses localhost
             external_worker_port=11001,
             external_client_port=11002,
+            external_key_manager_port=13001,
             node_wallet_key=app_key,  # just for tests make it same as APP_KEY
             fake_ton=True,
             local_mode=True,  # Don't build models for local execution
@@ -698,7 +760,7 @@ def run_local_all(cfg):
             **base_vars
         )
         cfg.extra_vars.update({
-            'TDX_IMAGE_HASH': hash_val,
+            'TEE_IMAGE_HASH': hash_val,
             'TON_CONFIG_FILE': '/tmp/run/global.config.json',
             'APP_KEY': app_key,
             'DISK_PATH': '/tmp',
@@ -770,10 +832,21 @@ def run_local_all(cfg):
     t.start()
     threads.append(t)
 
+    # Key Manager (magenta)
+    key_manager_proc = popen(
+        [f'{cfg.build_dir}/key-manager-runner', '--config', '/tmp/run/key-manager-config.json', '-v3', '--disable-ton',
+         '/tmp/run/fake-ton-config.json'],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    procs.append(client_proc)
+    t = threading.Thread(target=stream_output, args=(key_manager_proc, 'KEYMANAGER', '35'), daemon=True)
+    t.start()
+    threads.append(t)
+
     # Proxy-cli (cyan)
     proxycli_proc = popen([f'{cfg.build_dir}/tee/router', '-S', '8116@any',
                            '-R', '11001:127.0.0.1:11101@any',
                            '-R', '11002:127.0.0.1:11102@any',
+                           '-R', '13001:127.0.0.1:13101@any',
                            '--serialize-info'],
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     procs.append(proxycli_proc)
@@ -799,7 +872,7 @@ def parse_args():
 
     # Config file or explicit args
     parser.add_argument('config_file', nargs='?', help='Config file (INI format)')
-    parser.add_argument('--type', choices=['worker', 'proxy', 'client'], help='Node type')
+    parser.add_argument('--type', choices=['worker', 'proxy', 'client', 'key-manager'], help='Node type')
     parser.add_argument('--spec', help='Path to spec directory')
 
     # Node config
@@ -811,6 +884,7 @@ def parse_args():
     parser.add_argument('--external-ip', help='EXTERNAL_IP')
     parser.add_argument('--external-worker-port', help='EXTERNAL_WORKER_PORT')
     parser.add_argument('--external-client-port', help='EXTERNAL_CLIENT_PORT')
+    parser.add_argument('--external-key-manager-port', help='EXTERNAL_KEY_MANAGER_PORT')
     parser.add_argument('--wallet-private-key', dest='node_wallet_key', help='NODE_WALLET_KEY')
     parser.add_argument('--node-wallet_key', dest='node_wallet_key', help='NODE_WALLET_KEY')
 
@@ -837,9 +911,10 @@ def parse_args():
     parser.add_argument('--ssh-port', type=int)
     parser.add_argument('--vsock-cid', type=int)
     parser.add_argument('--tcp', action='append', type=int, default=[])
-    parser.add_argument('--no-tdx', action='store_true')
+    parser.add_argument('--no-tee', action='store_true')
+    parser.add_argument('--guestfwd-ip', help='IP address to forward quest connections')
     parser.add_argument('--image-dir', help='Image directory')
-    parser.add_argument('--build-dir', help='Build directory (defaults to BUILD_DIR env or cmake-build-default-tdx)')
+    parser.add_argument('--build-dir', help='Build directory (defaults to BUILD_DIR env or cmake-build-default-tee)')
 
     # Extra
     parser.add_argument('--set', action='append', default=[], help='Extra runtime vars (K=V)')

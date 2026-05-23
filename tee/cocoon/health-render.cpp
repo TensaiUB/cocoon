@@ -5,13 +5,14 @@
  */
 
 #include "health-render.h"
-#include "tdx-eventlog.h"
 #include "td/utils/logging.h"
 #include "td/utils/algorithm.h"
 #include "td/utils/misc.h"
 #include "td/utils/UInt.h"
 #include "td/utils/base64.h"
-#include "cocoon/tdx.h"
+#include "tee/cocoon/tdx/tdx.h"
+#include "tee/cocoon/sev/GuestDevice.h"
+#include "tee/cocoon/tdx/eventlog.h"
 #include "git.h"
 #include <sstream>
 #include <iomanip>
@@ -21,6 +22,15 @@
 #include <sys/wait.h>
 
 namespace cocoon {
+
+namespace {
+
+std::string read_image_hash() {
+  auto r = metrics::read_proc_file("/etc/tee/tee_image_hash.b64", 4096);
+  return r.is_ok() ? r.move_as_ok() : "(not available)";
+}
+
+}  // namespace
 
 // ============================================================================
 // Formatters
@@ -123,11 +133,6 @@ static int parse_float_as_int(const std::string& s) {
 
 namespace render_tdx {
 
-std::string read_image_hash() {
-  auto r = metrics::read_proc_file("/etc/tdx/tdx_image_hash.b64", 4096);
-  return r.is_ok() ? r.move_as_ok() : "(not available)";
-}
-
 std::string read_rtmr(int index) {
   if (index < 0 || index > 3) {
     return "(invalid index)";
@@ -161,8 +166,7 @@ std::string get_status() {
   out << "Image Hash: " << image_hash << "\n\n";
 
   // Try to generate TDX report and extract all attestation data
-  auto tdx_interface = tdx::TdxInterface::create();
-  auto report_result = tdx_interface->make_report(td::UInt512());
+  auto report_result = tdx::tdx_make_report(td::UInt512());
 
   if (report_result.is_error()) {
     out << "Error generating TDX report: " << (PSTRING() << report_result.error()) << "\n";
@@ -172,17 +176,17 @@ std::string get_status() {
       out << "RTMR" << i << ": " << read_rtmr(i) << "\n";
     }
   } else {
-    auto data_result = tdx_interface->get_data(report_result.ok());
+    auto data_result = tdx::tdx_parse_report(report_result.ok());
 
     if (data_result.is_error()) {
       out << "Error parsing TDX report: " << (PSTRING() << data_result.error()) << "\n";
-    } else if (data_result.ok().is_tdx()) {
+    } else {
       // Use existing operator<< to print all TDX data
       out << "Attestation Data:\n";
       out << (PSTRING() << data_result.ok());
 
       // Verify image hash
-      auto calc_hash = data_result.ok().image_hash();
+      auto calc_hash = tdx::image_hash(data_result.ok());
       std::string calculated = td::base64_encode(calc_hash.as_slice());
 
       out << "\nVerification:\n";
@@ -324,6 +328,48 @@ std::string get_metrics() {
 }
 
 }  // namespace render_gpu
+
+namespace render_sev {
+
+std::string get_status() {
+  std::ostringstream out;
+  out << "=== SEV STATUS ===\n\n";
+
+  out << "Build:\n";
+  out << "  Commit:  " << GitMetadata::CommitSHA1() << "\n";
+  out << "  Date:    " << GitMetadata::CommitDate() << "\n";
+  out << "  Message: " << GitMetadata::CommitSubject() << "\n\n";
+
+  auto image_hash = read_image_hash();
+  out << "Image Hash: " << image_hash << "\n\n";
+
+  auto maybe_guest_device = sev::GuestDevice::open();
+  if (maybe_guest_device.is_error()) {
+    out << "Error opening SEV GuestDevice: " << (PSTRING() << maybe_guest_device.error()) << "\n";
+  } else {
+    auto guest_device = maybe_guest_device.move_as_ok();
+    auto maybe_report = guest_device.get_report(td::UInt512::zero());
+    if (maybe_report.is_error()) {
+      out << "Error getting SEV report: " << (PSTRING() << maybe_report.error()) << "\n";
+    } else {
+      out << "Attestation Data:\n";
+      out << (PSTRING() << maybe_report.ok());
+
+      std::string calculated = td::base64_encode(maybe_report.ok().measurement.as_slice());
+      out << "\nVerification\n";
+
+      if (image_hash == calculated) {
+        out << "  Image hash: + VERIFIED\n";
+      } else {
+        out << "  Image hash: - MISMATCH (stored != calculated) (" << image_hash << " != " << calculated << ")\n";
+      }
+    }
+  }
+
+  return out.str();
+}
+
+}  // namespace render_sev
 
 // ============================================================================
 // Service Rendering
@@ -486,7 +532,7 @@ static std::string render_header(const std::vector<ServiceState>& states, const 
     }
   }
 
-  out << "TDX Image Hash: " << render_tdx::read_image_hash() << "\n";
+  out << "TDX Image Hash: " << read_image_hash() << "\n";
   out << "System: Load " << std::fixed << std::setprecision(2) << sys_m.load_1m;
 
   if (sys_m.mem_total > 0 && sys_m.mem_available > 0) {

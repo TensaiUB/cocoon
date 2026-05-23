@@ -23,8 +23,10 @@ if [[ "$1" == "final" ]]; then
     mkosi-chroot depmod "$KERNEL_VERSION"
   fi
 
-  mkosi-chroot dkms install nvidia/580.95.05 -k $KERNEL_VERSION --force
-  mkosi-chroot rm -r /var/lib/dkms/nvidia/580.95.05/$KERNEL_VERSION/x86_64/log
+  sed -i -E 's/\\"nvidia id: [^"]+\\"/\\"nvidia id: cocoon build\\"/' $BUILDROOT/usr/src/nvidia-595.58.03/utils.mk
+  mkosi-chroot dkms build nvidia/595.58.03 -k $KERNEL_VERSION --force
+  mkosi-chroot dkms install nvidia/595.58.03 -k $KERNEL_VERSION --force
+  mkosi-chroot rm -r /var/lib/dkms/nvidia/595.58.03/$KERNEL_VERSION/x86_64/log
   cp "$SRCDIR/pkg-aux/pccs-package-lock.json" "$BUILDROOT/opt/intel/sgx-dcap-pccs/package-lock.json"
 
   cp "$SRCDIR/pkg-aux/rules.v4" "$BUILDROOT/etc/iptables/rules.v4"

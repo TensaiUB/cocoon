@@ -86,19 +86,19 @@ See [`tee/cocoon/gen-cert.cpp`](../tee/cocoon/gen-cert.cpp):
 
 ```bash
 # No attestation (development)
-./gen-cert --name dev --tdx none
+./gen-cert --name dev --tee none
 
-# Fake attestation (testing without TDX hardware)
-./gen-cert --name test --tdx fake_tdx
+# Fake attestation (testing without TEE hardware)
+./gen-cert --name test --tee fake_tee
 
-# Real TDX attestation (production, must run inside TDX)
-./gen-cert --name worker --tdx tdx --force
+# Real TDX attestation (production, must run inside TEE)
+./gen-cert --name worker --tee tee --force
 ```
 
 Outputs:
 - `<name>_cert.pem` - Certificate with embedded quote
 - `<name>_key.pem` - Ed25519 private key
-- `<name>_image_hash.b64` - TDX image hash (base64)
+- `<name>_image_hash.b64` - TEE image hash (base64)
 
 ## Certificate Verification
 
@@ -148,9 +148,9 @@ Implementation in [`tee/cocoon/tdx.cpp`](../tee/cocoon/tdx.cpp) - struct `Defaul
 ### Built-in Policies
 
 - **`any`** - No attestation required (no TdxInterface)
-- **`fake_tdx`** - Accept fake quotes for testing
-- **`tdx`** - Require real TDX with default checks
-- **`tdx` with constraints** - Require specific measurements
+- **`fake_tee`** - Accept fake quotes for testing
+- **`tee`** - Require real TDX with default checks
+- **`tee` with constraints** - Require specific measurements
 
 ### Policy Constraints
 

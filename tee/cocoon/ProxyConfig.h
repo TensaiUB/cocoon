@@ -1,7 +1,7 @@
 #pragma once
-#include "cocoon/tdx.h"
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/Status.h"
+#include "tee/cocoon/RATLS.h"
 #include <map>
 #include <optional>
 #include <string>
@@ -14,14 +14,9 @@ namespace cocoon {
  */
 struct PolicyConfig {
   std::string name;
-  std::string type;  // "any", "fake_tdx", "tdx"
+  std::string type;  // "any", "fake_tee", "tee"
   std::string description;
-
-  // TDX policy configuration (includes image hash, allowed measurements, etc.)
-  tdx::PolicyConfig tdx_config;
-
-  // Legacy parameters for backward compatibility
-  std::map<std::string, std::string> parameters;  // Additional policy-specific parameters
+  RATLSPolicyConfig ratls_policy;
 };
 
 /**

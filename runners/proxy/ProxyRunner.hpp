@@ -22,7 +22,8 @@ struct WorkerModel {
 
 class ProxyRunner : public BaseRunner {
  public:
-  ProxyRunner(std::string engine_config_filename) : BaseRunner(std::move(engine_config_filename)) {
+  ProxyRunner(std::string engine_config_filename, td::actor::Scheduler *scheduler)
+      : BaseRunner(RunnerRole::Proxy, std::move(engine_config_filename), scheduler) {
   }
 
   /* CONST PARAMS */
@@ -45,7 +46,7 @@ class ProxyRunner : public BaseRunner {
     return 0;
   }
   static constexpr td::int32 max_proto_version() {
-    return 2;
+    return 4;
   }
 
   /* SIMPLE GETTERS */
@@ -71,9 +72,6 @@ class ProxyRunner : public BaseRunner {
   auto active_config_version() const {
     return active_config_version_;
   }
-  bool check_worker_hashes() const {
-    return check_worker_hashes_;
-  }
   const auto &sc() const {
     return sc_;
   }
@@ -82,9 +80,6 @@ class ProxyRunner : public BaseRunner {
   }
 
   /* SIMPLE SETTERS */
-  void enable_check_worker_hashes() {
-    check_worker_hashes_ = true;
-  }
   void set_owner_address(block::StdAddress owner_address) {
     owner_address_ = std::move(owner_address);
   }
@@ -93,7 +88,7 @@ class ProxyRunner : public BaseRunner {
   td::Result<std::shared_ptr<ProxyWorkerInfo>> register_worker(const block::StdAddress &worker_owner_address);
   td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> register_worker_connection(
       std::shared_ptr<ProxyWorkerInfo> worker, TcpClient::ConnectionId connection_id, const td::Bits256 &worker_hash,
-      std::string model, td::int32 coefficient, td::int32 max_active_requests);
+      std::string model, td::int32 coefficient, td::int32 max_active_requests, std::string machine_description_json);
   void unregister_worker_connection(std::shared_ptr<ProxyWorkerConnectionInfo> worker_connection_info);
   void sign_worker_payment(ProxyWorkerInfo &w);
   void on_worker_update(const block::StdAddress &worker_owner_address, const block::StdAddress &worker_sc_address,
@@ -127,7 +122,8 @@ class ProxyRunner : public BaseRunner {
   std::unique_ptr<BaseInboundConnection> allocate_inbound_connection(TcpClient::ConnectionId connection_id,
                                                                      TcpClient::ListeningSocketId listening_socket_id,
                                                                      const RemoteAppType &remote_app_type,
-                                                                     const td::Bits256 &remote_app_hash) override;
+                                                                     const td::Bits256 &remote_app_hash,
+                                                                     const td::Bits256 &verified_by) override;
 
   /* INITIALIZATION */
   void load_config(td::Promise<td::Unit> promise) override;
@@ -170,10 +166,6 @@ class ProxyRunner : public BaseRunner {
   void receive_message(TcpClient::ConnectionId connection_id, td::BufferSlice query) override;
   void receive_query(TcpClient::ConnectionId connection_id, td::BufferSlice query,
                      td::Promise<td::BufferSlice> promise) override;
-  void receive_http_request(
-      std::unique_ptr<ton::http::HttpRequest> request, std::shared_ptr<ton::http::HttpPayload> payload,
-      td::Promise<std::pair<std::unique_ptr<ton::http::HttpResponse>, std::shared_ptr<ton::http::HttpPayload>>> promise)
-      override;
 
   /* CONTROL */
   void proxy_enable_disable(td::int64 value);
@@ -183,7 +175,8 @@ class ProxyRunner : public BaseRunner {
   td::Result<std::shared_ptr<ProxyWorkerConnectionInfo>> choose_connection(const std::string &model_name,
                                                                            td::int64 tokens_available,
                                                                            td::int64 max_coefficient,
-                                                                           td::int64 max_tokens);
+                                                                           td::int64 max_tokens,
+                                                                           td::int32 min_proto_version);
   void forward_query(TcpClient::ConnectionId client_connection_id,
                      ton::tl_object_ptr<cocoon_api::client_runQueryEx> req);
   void finish_request(const td::Bits256 &worker_request_id, const td::Bits256 &client_request_id,
@@ -215,6 +208,7 @@ class ProxyRunner : public BaseRunner {
   std::string http_charge(std::string client_sc_address);
   std::string http_enable_disable(td::int64 disable_up_to_version);
   std::string http_withdraw();
+  std::string http_change_worker_model(std::string connection_id, std::string new_model_name);
 
  private:
   block::StdAddress owner_address_;
@@ -236,7 +230,6 @@ class ProxyRunner : public BaseRunner {
   td::int64 is_disabled_until_version_{0};
 
   bool generate_random_private_key_{false};
-  bool check_worker_hashes_{false};
   bool running_withdraw_{false};
   td::uint64 withdraw_request_id_{0};
   bool running_save_state_to_blockchain_{false};

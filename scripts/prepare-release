@@ -85,7 +85,7 @@ cp -r spec/spec-proxy "$DIST_DIR/spec/"
 cp -r spec/fake-ton "$DIST_DIR/spec/"
 cp spec/mainnet-base-ton-config.json "$DIST_DIR/spec/" 2>/dev/null || true
 
-# Copy image files (including OVMF.fd for reproducible TDX measurement)
+# Copy image files (including OVMF.fd for reproducible TEE measurement)
 mkdir -p "$DIST_DIR/images/$BUILD_TYPE"
 cp "$IMAGE_SRC"/{image.img,image.vmlinuz,image.initrd,image.cmdline,OVMF.fd} "$DIST_DIR/images/$BUILD_TYPE/"
 

@@ -2,6 +2,7 @@
 
 #include "auto/tl/cocoon_api.h"
 #include "auto/tl/cocoon_api.hpp"
+#include "common/bitstring.h"
 #include "errorcode.h"
 #include "runners/BaseRunner.hpp"
 #include "td/actor/ActorId.h"
@@ -22,8 +23,9 @@ struct ProxyRunningRequest : public td::actor::Actor {
   ProxyRunningRequest(td::Bits256 id, td::Bits256 client_request_id, TcpClient::ConnectionId client_connection_id,
                       td::int32 client_proto_version, std::shared_ptr<ProxyClientInfo> client,
                       td::int32 worker_proto_version, std::shared_ptr<ProxyWorkerConnectionInfo> worker,
-                      td::BufferSlice data, double timeout, bool enable_debug, td::int64 reserved_tokens,
-                      td::actor::ActorId<ProxyRunner> runner, std::shared_ptr<ProxyStats> stats)
+                      td::BufferSlice data, td::Bits256 encrypted_with, double timeout, bool enable_debug,
+                      td::int64 reserved_tokens, td::actor::ActorId<ProxyRunner> runner,
+                      std::shared_ptr<ProxyStats> stats)
       : id_(id)
       , client_request_id_(client_request_id)
       , client_connection_id_(client_connection_id)
@@ -32,6 +34,7 @@ struct ProxyRunningRequest : public td::actor::Actor {
       , worker_proto_version_(worker_proto_version)
       , worker_(std::move(worker))
       , data_(std::move(data))
+      , encrypted_with_(encrypted_with)
       , timeout_(timeout)
       , enable_debug_(enable_debug)
       , reserved_tokens_(reserved_tokens)
@@ -78,7 +81,7 @@ struct ProxyRunningRequest : public td::actor::Actor {
     }
   }
 
-  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> create_final_info(cocoon_api::proxy_queryFinalInfo &info);
+  ton::tl_object_ptr<cocoon_api::client_queryFinalInfo> create_final_info(cocoon_api::proxy_queryFinalInfo *info);
   ton::tl_object_ptr<cocoon_api::proxy_queryFinalInfo> create_final_info_from_old(
       ton::tl_object_ptr<cocoon_api::tokensUsed> info);
 
@@ -92,6 +95,7 @@ struct ProxyRunningRequest : public td::actor::Actor {
   td::int32 worker_proto_version_;
   std::shared_ptr<ProxyWorkerConnectionInfo> worker_;
   td::BufferSlice data_;
+  td::Bits256 encrypted_with_;
   double timeout_;
   bool enable_debug_;
   td::int64 reserved_tokens_;

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# init.sh - TDX guest initialization script
+# First script to run on TDX guest startup
+set -euo pipefail
+
+RPATH=$(dirname "${BASH_SOURCE[0]}")
+
+. "${RPATH}"/cocoon-init-common
+
+RTMR3_PATH="/sys/class/misc/tdx_guest/measurements/rtmr3:sha384"
+ATTESTATION_LOG="/var/log/tdx-attestation.log"
+
+# Function to add line to attestation log and extend RTMR3
+attest_log() {
+  local message="$1"
+  
+  # Validate message contains only printable ASCII characters (no newlines, tabs, etc.)
+  if [[ "$message" =~ [[:cntrl:]] ]]; then
+    echo "ERR: Attestation message contains control characters (newlines, tabs, etc.)" >&2
+    exit 1
+  fi
+  
+  # Add to attestation log
+  echo "$message" >> "$ATTESTATION_LOG"
+  echo "Logged: $message"
+  
+  # Extend RTMR3 with SHA384 of the message (48 raw bytes)
+  local rtmr_hash_hex=$(echo -n "$message" | sha384sum | cut -d' ' -f1)
+  if ! echo -n "$message" | sha384sum | cut -d' ' -f1 | xxd -r -p > "$RTMR3_PATH"; then
+    echo "ERR: Failed to extend RTMR3 with message: $message" >&2
+    exit 1
+  fi
+  
+  echo "RTMR3 extended with: $rtmr_hash_hex"
+}
+
+make_seal_keys() {
+  # Generate sealed keys
+  echo "Generating sealed keys..."
+  
+  # Keys to generate: "name:filename"
+  # Load MR_ENCLAVE (required for production)
+  if [ ! -f "/usr/share/cocoon/mr_enclave.txt" ]; then
+    echo "ERR: MR_ENCLAVE not found: /usr/share/cocoon/mr_enclave.txt" >&2
+    exit 1
+  fi
+  
+  mr_enclave=$(cat /usr/share/cocoon/mr_enclave.txt)
+  echo "Using MR_ENCLAVE: $mr_enclave"
+  
+  if [[ "$is_debug" = true ]]; then
+    attest_log "cocoon:cocoon_debug"
+  fi
+  
+  for key_spec in "${KEYS[@]}"; do
+    key_name="${key_spec%%:*}"
+    key_file="$CERT_DIR/${key_spec##*:}"
+    
+    if [[ "$is_debug" = true ]]; then
+      echo -n "cococooncococooncococooncococoon" > "$key_file"
+      [[ "$key_name" = "disk_encryption" ]] && key_hash="330b40587dfe15b2a0701c5b9141b108b71474b8b3d4f719f916d944c622b91c"
+    else
+      key_hash=$(seal-client --mr-enclave "$mr_enclave" --output "$key_file" --key-name "$key_name") || {
+        echo "ERR: Failed to generate sealed key: $key_name" >&2
+        exit 1
+      }
+    fi
+    
+    chmod 400 "$key_file"
+    echo "  $key_name -> $key_file"
+  done
+  
+  # Save disk encryption key hash
+  echo "$key_hash" > "$KEY_HASH_FILE"
+  chmod 400 "$KEY_HASH_FILE"
+}
+
+echo "=== TDX Guest Initialization ==="
+
+init_tdx_pccs
+init_sev_pki
+create_secure_directories
+
+echo "Preparing specification..."
+spec_hash=$(prepare_spec)
+echo "Specification prepared successfully"
+echo "Spec hash: $spec_hash"
+
+make_seal_keys
+# Add spec hash to attestation log and extend RTMR3
+attest_log "cocoon:spec.tree=$spec_hash"
+
+echo "Spec preparation completed, configs will be rendered by init scripts"
+
+# Add tdx_inited to attestation log and extend RTMR3
+attest_log "cocoon:tdx_inited"
+
+render_ton_config
+generate_tee_certificate
+generate_system_vars
+setup_persistent_disk
+fix_permissions
+print_final_status
+
+echo "=== TDX Status ==="
+echo ""
+echo "  RTMR3:     Extended and sealed"
+echo "  Log:       $ATTESTATION_LOG"
+echo ""
+echo "NEXT STEPS:"
+echo "  1. Verify attestation log: $ATTESTATION_LOG"
+echo ""
+echo "TDX guest is ready for production workloads"

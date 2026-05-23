@@ -42,6 +42,7 @@ proxyRunner.config
   client_rpc_port:int
   http_port:int
   owner_address:string
+  connect_to_proxy_via:string
   root_contract_address:string
   machine_specific_private_key:int256
   node_wallet_key:int256
@@ -67,7 +68,10 @@ workerRunner.config
   check_proxy_hashes:Bool
   max_active_requests:int
   image_hash:int256
-  http_access_hash:string = workerRunner.Config;
+  http_access_hash:string 
+  change_model_script:string
+  machine_description_json:string
+  = workerRunner.Config;
 
 clientRunner.config
   is_test:Bool
@@ -86,10 +90,13 @@ clientRunner.config
 keyStorageRunner.config
   is_test:Bool
   is_testnet:Bool
+  add_default_key:Bool
   rpc_port:int
   http_port:int
+  owner_address:string
   root_contract_address:string
   machine_specific_private_key:int256
+  node_wallet_key:int256
   ton_config_filename:string
   db_path:string
   check_hashes:Bool
@@ -97,6 +104,7 @@ keyStorageRunner.config
   http_access_hash:string = keyStorageRunner.Config;
 
 rootConfig.registeredProxy seqno:int address:string = rootConfig.RegisteredProxy;
+rootConfig.registeredPublicKey public_key:int256 key_type:int expire_at:int = rootConfig.RegisteredPublicKey;
 
 rootConfig.pseudo proxy_hashes:(vector int256) worker_hashes:(vector int256) model_hashes:(vector int256) model_types:(vector string)
                     registered_proxies:(vector rootConfig.registeredProxy)
@@ -105,11 +113,13 @@ rootConfig.pseudo proxy_hashes:(vector int256) worker_hashes:(vector int256) mod
                     last_proxy_seqno:int
                     version:int
                     params_version:int
+                    registered_public_keys:(vector rootConfig.registeredPublicKey)
+                    key_manager_address:string
                     proxy_sc_code:string
                     worker_sc_code:string
                     client_sc_code:string
                     root_owner_address:string = rootConfig.Config;
-rootConfig.configV5 root_owner_address:string proxy_hashes:(vector int256) registered_proxies:(vector rootConfig.registeredProxy)
+rootConfig.configV7 root_owner_address:string proxy_hashes:(vector int256) registered_proxies:(vector rootConfig.registeredProxy)
                     last_proxy_seqno:int worker_hashes:(vector int256) model_hashes:(vector int256) version:int 
                     struct_version:int
                     params_version:int
@@ -125,6 +135,13 @@ rootConfig.configV5 root_owner_address:string proxy_hashes:(vector int256) regis
                     client_delay_before_close:int
                     min_proxy_stake:long
                     min_client_stake:long
+                    registered_public_keys:(vector rootConfig.registeredPublicKey)
+                    key_manager_public_key:int256
+                    key_manager_image_hash:int256
+                    key_manager_address:string
+                    verified_proxy_keys:(vector int256)
+                    verified_worker_keys:(vector int256)
+                    verified_key_manager_keys:(vector int256)
                     proxy_sc_code:string
                     worker_sc_code:string
                     client_sc_code:string
@@ -156,7 +173,7 @@ proxyDb.oldInstance contract_address:string closing_state:int close_at:int next_
 keyManagerDb.configEmpty = keyManagerDb.Config;
 keyManagerDb.configV1 root_contract_version:int = keyManagerDb.Config;
 
-keyManagerDb.key private_key:int256 for_proxies:Bool for_workers:Bool valid_since_config_version:int valid_since_utime:int
+keyManagerDb.key private_key:int256 key_type:int valid_since_config_version:int valid_since_utime:int
                  valid_until_utime:int = keyManagerDb.Key;
 
 ---functions---
@@ -175,6 +192,7 @@ worker.params#869c73ed flags:#
   max_active_requests:flags.0?int
   min_proto_version:flags.1?int
   max_proto_version:flags.1?int
+  machine_description_json:flags.2?string
   = worker.Params;
 
 proxy.params#d5c5609f flags:# 
@@ -236,8 +254,8 @@ client.connectToProxy params:client.params min_config_version:int = client.Conne
 client.authorizeWithProxyShort data:bytes = client.AuthorizationWithProxy;
 client.authorizeWithProxyLong = client.AuthorizationWithProxy;
 client.runQuery model_name:string query:bytes max_coefficient:int max_tokens:int timeout:double request_id:int256 min_config_version:int = client.QueryAnswer;
-client.runQueryEx model_name:string query:bytes max_coefficient:int max_tokens:int timeout:double request_id:int256 min_config_version:int 
-       flags:# enable_debug:flags.0?Bool = client.QueryAnswerEx;
+client.runQueryEx#f54cb74b model_name:string query:bytes max_coefficient:int max_tokens:int timeout:double request_id:int256 min_config_version:int 
+       flags:# enable_debug:flags.0?Bool public_key:flags.1?int256 = client.QueryAnswerEx;
 client.requestRefund = client.Refund;
 
 client.updatePaymentStatus = client.PaymentStatus;
@@ -266,8 +284,8 @@ proxy.workerRequestPayment request_id:int256 signed_payment:proxy.SignedPayment 
 ---functions---
 
 proxy.runQuery query:bytes signed_payment:proxy.SignedPayment coefficient:long timeout:double request_id:int256 = proxy.QueryAnswer;
-proxy.runQueryEx query:bytes signed_payment:proxy.SignedPayment coefficient:long timeout:double request_id:int256 
-        flags:# enable_debug:flags.0?Bool = proxy.QueryAnswer;
+proxy.runQueryEx#c805e7e2 query:bytes signed_payment:proxy.SignedPayment coefficient:long timeout:double request_id:int256 
+        flags:# enable_debug:flags.0?Bool private_key:flags.1?int256 = proxy.QueryAnswer;
 
 ---types---
 
@@ -281,6 +299,8 @@ worker.proxyHandshakeCompleted = worker.HandshakeCompleted;
 
 worker.paymentStatus signed_payment:proxy.SignedPayment db_tokens:long max_tokens:long = worker.PaymentStatus;
 
+worker.changedModel = worker.ChangedModel;
+
 ---functions---
 
 worker.connectToProxy params:worker.params = worker.ConnectedToProxy;
@@ -289,7 +309,7 @@ worker.extendedCompareBalanceWithProxy tokens_committed_to_db:long other:bytes =
 worker.proxyHandshakeComplete is_disabled:Bool = worker.HandshakeCompleted;
 
 worker.updatePaymentStatus = worker.PaymentStatus;
-
+worker.changeModel new_model:string = worker.ChangedModel;
 
 ---types---
 
@@ -298,8 +318,8 @@ keyManager.privateKeys keys:(vector keyManager.privateKey) = keyManager.PrivateK
 
 ---functions---
 
-keyManager.getWorkerPrivateKeys min_config_version:int = keyManager.PrivateKeys;  
-keyManager.getProxyPrivateKeys min_config_version:int = keyManager.PrivateKeys;  
+keyManager.getWorkerPrivateKeys proto_version:int = keyManager.PrivateKeys;  
+keyManager.getProxyPrivateKeys proto_version:int = keyManager.PrivateKeys;  
 
 ---types---
 

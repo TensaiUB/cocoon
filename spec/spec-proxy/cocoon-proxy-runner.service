@@ -1,5 +1,5 @@
 [Unit]
-Description=TDX proxy-runner
+Description=TEE proxy-runner
 
 [Service]
 Type=simple

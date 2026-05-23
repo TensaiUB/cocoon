@@ -24,15 +24,22 @@ WorkerRunner *WorkerProxyConnection::runner() {
  */
 
 void WorkerProxyConnection::send_handshake() {
-  if (runner()->need_check_proxy_hash()) {
+  if (runner()->check_image_hashes()) {
     if (!runner()->runner_config()->root_contract_config->has_proxy_hash(remote_app_hash())) {
       LOG(WARNING) << "proxy hash not in root contract registry (hash=" << remote_app_hash().to_hex() << "), but allowing anyway";
     }
   }
+  {
+    auto S = runner()->check_verification_key(remote_app_type(), verified_by());
+    if (S.is_error()) {
+      return fail_connection(std::move(S));
+    }
+  }
+  auto flags = 3 | (runner()->min_proto_version() >= 4 ? 4 : 0);
   auto params = ton::create_tl_object<cocoon_api::worker_params>(
-      3, runner()->owner_address().rserialize(true), runner()->model_name(), runner()->coefficient(),
+      flags, runner()->owner_address().rserialize(true), runner()->model_name(), runner()->coefficient(),
       runner()->is_test(), runner()->proxy_targets_number(), runner()->max_active_requests(),
-      runner()->min_proto_version(), runner()->max_proto_version());
+      runner()->min_proto_version(), runner()->max_proto_version(), runner()->machine_description_json());
   auto req = cocoon::create_serialize_tl_object<cocoon_api::worker_connectToProxy>(std::move(params));
   runner()->send_handshake_query_to_connection(
       connection_id(), "send_proxy_handshake", std::move(req), td::Timestamp::in(30.0),

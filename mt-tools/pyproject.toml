@@ -2,7 +2,7 @@
 name = "mt"
 version = "0.1.0"
 description = "Machine translation tools"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "requests",
     "openai-harmony",
@@ -12,6 +12,16 @@ dependencies = [
     "rich",
     "duckdb",
     "bert-score",
+    # Audio processing
+    "speechbrain>=1.0.0",
+    "soundfile",
+    "scipy",
+    "torchaudio>=2.2,<2.5",
+    "torch>=2.2,<2.5",
+    "openai-whisper",
+    "transformers",
+    "accelerate",
+    "jiwer",  # WER calculation for transcription
 ]
 
 [project.scripts]

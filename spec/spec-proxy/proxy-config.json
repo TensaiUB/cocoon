@@ -6,9 +6,10 @@
   "client_rpc_port"  : 11102,
   "ton_config_filename": "$TON_CONFIG_FILE",
   "owner_address": "$OWNER_ADDRESS",
-  "image_hash": "$TDX_IMAGE_HASH",
+  "image_hash": "$TEE_IMAGE_HASH",
   "node_wallet_key": "$NODE_WALLET_KEY",
   "root_contract_address": "$ROOT_CONTRACT_ADDRESS",
   "machine_specific_private_key": "$APP_KEY",
+  "connect_to_proxy_via": "127.0.0.1:8116",
   "db_path": "$DISK_PATH/proxy-db"
 }

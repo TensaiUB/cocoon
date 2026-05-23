@@ -22,7 +22,6 @@ int main(int argc, char **argv) {
 
   std::string engine_config_filename = "worker-config.json";
   std::string pseudo_config_filename = "";
-  bool check_proxy_hash = false;
 
   td::OptionParser option_parser;
   option_parser.set_description("worker runner: run COCOON worker");
@@ -34,7 +33,6 @@ int main(int argc, char **argv) {
   });
   option_parser.add_option('C', "disable-ton", "disable ton and use fake ton config",
                            [&](td::Slice opt) { pseudo_config_filename = opt.str(); });
-  option_parser.add_option('p', "check-proxy-hashes", "check proxy hash", [&]() { check_proxy_hash = true; });
   option_parser.run(argc, argv, 0).ensure();
 
   td::actor::set_debug(true);
@@ -43,14 +41,12 @@ int main(int argc, char **argv) {
   td::actor::ActorOwn<cocoon::WorkerRunner> worker_runner;
 
   scheduler.run_in_context([&] {
-    worker_runner = td::actor::create_actor<cocoon::WorkerRunner>("worker", std::move(engine_config_filename));
+    worker_runner =
+        td::actor::create_actor<cocoon::WorkerRunner>("worker", std::move(engine_config_filename), &scheduler);
     td::actor::send_lambda(worker_runner, [&]() {
       auto &ptr = worker_runner.get_actor_unsafe();
       if (pseudo_config_filename.size() > 0) {
         ptr.disable_ton(pseudo_config_filename);
-      }
-      if (check_proxy_hash) {
-        ptr.enable_check_proxy_hash();
       }
       ptr.initialize();
     });
