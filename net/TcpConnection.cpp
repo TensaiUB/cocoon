@@ -47,7 +47,7 @@ void TcpConnection::start_up() {
       [&](const TcpConnectionSimple &t) {
         auto R = td::SocketFd::open(connect_to_);
         if (R.is_error()) {
-          fail(R.move_as_error_prefix(PSTRING() << "tcp: failed to connect to " << connect_to_ << ": "));
+          LOG(WARNING) << "tcp: failed to connect to " << connect_to_ << ": " << R.move_as_error();
           return;
         }
         socket_pipe_ = td::make_socket_pipe(R.move_as_ok());
@@ -56,7 +56,7 @@ void TcpConnection::start_up() {
       [&](const TcpConnectionSocks5 &t) {
         auto R = td::SocketFd::open(t.connect_via);
         if (R.is_error()) {
-          fail(R.move_as_error_prefix(PSTRING() << "tcp: failed to connect to " << t.connect_via << ": "));
+          LOG(WARNING) << "tcp: failed to connect to " << t.connect_via << ": " << R.move_as_error();
           return;
         }
         td::connect(
@@ -64,9 +64,7 @@ void TcpConnection::start_up() {
               if (R.is_ok()) {
                 td::actor::send_closure(self, &TcpConnection::socks5_connected, R.move_as_ok());
               } else {
-                td::actor::send_closure(
-                    self, &TcpConnection::fail,
-                    R.move_as_error_prefix(PSTRING() << "tcp: failed to connect to " << connect_to << " via socks5: "));
+                LOG(WARNING) << "tcp: failed to connect to " << connect_to << " via socks5: " << R.move_as_error();
               }
             },
             socks5(R.move_as_ok(), connect_to_, "", ""));
@@ -74,7 +72,7 @@ void TcpConnection::start_up() {
       [&](const TcpConnectionTls &t) {
         auto R = td::SocketFd::open(connect_to_);
         if (R.is_error()) {
-          fail(R.move_as_error_prefix(PSTRING() << "tcp: failed to connect to " << connect_to_ << ": "));
+          LOG(WARNING) << "tcp: failed to connect to " << connect_to_ << ": " << R.move_as_error();
           return;
         }
         auto pipe = td::make_socket_pipe(R.move_as_ok());
@@ -83,8 +81,7 @@ void TcpConnection::start_up() {
               if (R.is_ok()) {
                 td::actor::send_closure(self, &TcpConnection::tls_solved_pow, R.move_as_ok());
               } else {
-                td::actor::send_closure(self, &TcpConnection::fail,
-                                        R.move_as_error_prefix("tcp: failed to solve pow: "));
+                LOG(WARNING) << "tcp: failed to solve pow: " << R.move_as_error();
               }
             },
             pow::solve_pow_client(std::move(pipe), 28));
